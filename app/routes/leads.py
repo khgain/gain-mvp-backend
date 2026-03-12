@@ -13,7 +13,6 @@ POST   /leads/{id}/log-action       — log a manual action
 GET    /leads/{id}/timeline         — workflow run history for a lead
 GET    /leads/{id}/validation       — Tier 1 + Tier 2 validation results
 """
-import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -38,29 +37,6 @@ logger = get_logger("routes.leads")
 
 def _success(data=None, message="Success"):
     return {"success": True, "data": data, "message": message}
-
-
-async def _auto_trigger_qualification(lead_id: str, tenant_id: str) -> None:
-    """
-    Fire the ElevenLabs qualification call directly after lead creation.
-
-    Bypasses Celery entirely — asyncio.run() inside a Celery eager task conflicts
-    with FastAPI's running event loop. Direct call is simpler and equally reliable
-    for the single-process Railway deployment.
-    """
-    try:
-        from app.services.voice_service import trigger_outbound_call
-        conv_id = await trigger_outbound_call(lead_id, tenant_id)
-        if conv_id:
-            logger.info(
-                f"[AUTO-TRIGGER] Call placed — lead_id={lead_id} conv_id={conv_id}"
-            )
-        else:
-            logger.warning(
-                f"[AUTO-TRIGGER] Call skipped (ElevenLabs not configured) — lead_id={lead_id}"
-            )
-    except Exception as exc:
-        logger.error(f"[AUTO-TRIGGER] Call failed for lead_id={lead_id}: {exc}")
 
 
 def _mask_pan(pan: str) -> str:
@@ -187,10 +163,6 @@ async def create_lead(
 
     created = await db.leads.find_one({"_id": result.inserted_id})
     logger.info(f"Lead created — lead_id={lead_id} tenant={current_user.tenant_id}")
-
-    # Auto-trigger qualification call in background — does not block HTTP response
-    asyncio.create_task(_auto_trigger_qualification(lead_id, current_user.tenant_id))
-
     return _success(data=_serialize_lead(created), message="Lead created")
 
 
@@ -335,9 +307,9 @@ async def trigger_agent(
 
     now = datetime.now(timezone.utc)
     try:
-        from app.services.voice_service import enqueue_qualification_call
-        await enqueue_qualification_call(lead_id, current_user.tenant_id)
-        message = "Voice call enqueued"
+        from app.services.voice_service import trigger_outbound_call
+        conv_id = await trigger_outbound_call(lead_id, current_user.tenant_id)
+        message = f"Qualification call initiated (conv_id={conv_id})" if conv_id else "Call skipped (ElevenLabs not configured)"
     except Exception as exc:
         logger.error(f"Failed to trigger agent for lead_id={lead_id}: {exc}")
         raise HTTPException(status_code=500, detail=f"Failed to trigger agent: {exc}")
@@ -346,7 +318,7 @@ async def trigger_agent(
         "tenant_id": current_user.tenant_id,
         "lead_id": lead_id,
         "event_type": "AGENT_TRIGGERED",
-        "message": f"Agent manually triggered by {current_user.email}",
+        "message": f"Qualification call triggered by {current_user.email}",
         "created_by": current_user.user_id,
         "created_at": now,
     })
