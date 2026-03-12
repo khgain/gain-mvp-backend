@@ -69,11 +69,30 @@ async def _gmail_watch_renewal_loop():
         await asyncio.sleep(SIX_DAYS)
 
 
+async def _auto_seed_if_empty():
+    """Seed default users/tenant if the database is empty (first deploy)."""
+    try:
+        from app.database import get_db
+        db = get_db()
+        if await db.users.count_documents({}) == 0:
+            logger.info("No users found — running auto-seed...")
+            import sys, os
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            from scripts.seed import seed
+            await seed()
+            logger.info("Auto-seed complete")
+        else:
+            logger.info("Database already has users — skipping auto-seed")
+    except Exception as e:
+        logger.error(f"Auto-seed failed (non-fatal): {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     import asyncio
     logger.info("=== Gain AI Backend starting ===")
     await connect_to_mongo()
+    await _auto_seed_if_empty()
     asyncio.create_task(_gmail_watch_renewal_loop())
     yield
     await close_mongo_connection()
