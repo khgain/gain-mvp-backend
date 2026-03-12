@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     LEADS_EMAIL_DOMAIN: Optional[str] = None
 
     # CORS — comma-separated list of allowed origins
-    ALLOWED_ORIGINS: str = "http://localhost:3000"
+    ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:5173,https://gain-mvp-frontend.vercel.app"
 
     # Environment
     ENVIRONMENT: str = "development"
