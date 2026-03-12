@@ -31,7 +31,7 @@ from app.models.lead import (
 from app.utils.encryption import encrypt_field, decrypt_field
 from app.utils.logging import get_logger
 
-router = APIRouter(tags=["Leads"])
+router = APIRouter(prefix="/leads", tags=["Leads"])
 logger = get_logger("routes.leads")
 
 
