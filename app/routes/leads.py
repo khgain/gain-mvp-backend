@@ -13,6 +13,7 @@ POST   /leads/{id}/log-action       — log a manual action
 GET    /leads/{id}/timeline         — workflow run history for a lead
 GET    /leads/{id}/validation       — Tier 1 + Tier 2 validation results
 """
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -37,6 +38,40 @@ logger = get_logger("routes.leads")
 
 def _success(data=None, message="Success"):
     return {"success": True, "data": data, "message": message}
+
+
+async def _auto_trigger_qualification(lead_id: str, tenant_id: str) -> None:
+    """
+    Fire the qualification call automatically after lead creation.
+    Tries Celery/SQS first; falls back to a direct ElevenLabs API call
+    so it works even when SQS workers are not deployed yet.
+    """
+    try:
+        from app.services.voice_service import enqueue_qualification_call
+        await enqueue_qualification_call(lead_id, tenant_id)
+        logger.info(f"[AUTO-TRIGGER] Qualification call enqueued (Celery) — lead_id={lead_id}")
+    except Exception as celery_exc:
+        logger.warning(
+            f"[AUTO-TRIGGER] Celery enqueue failed for lead_id={lead_id}: {celery_exc}. "
+            "Falling back to direct ElevenLabs call."
+        )
+        try:
+            from app.services.voice_service import trigger_outbound_call
+            conv_id = await trigger_outbound_call(lead_id, tenant_id)
+            if conv_id:
+                logger.info(
+                    f"[AUTO-TRIGGER] Direct call placed — lead_id={lead_id} conv_id={conv_id}"
+                )
+            else:
+                logger.warning(
+                    f"[AUTO-TRIGGER] Direct call skipped (ElevenLabs not configured) "
+                    f"— lead_id={lead_id}"
+                )
+        except Exception as direct_exc:
+            logger.error(
+                f"[AUTO-TRIGGER] Both Celery and direct call failed for lead_id={lead_id}: "
+                f"{direct_exc}"
+            )
 
 
 def _mask_pan(pan: str) -> str:
@@ -163,6 +198,10 @@ async def create_lead(
 
     created = await db.leads.find_one({"_id": result.inserted_id})
     logger.info(f"Lead created — lead_id={lead_id} tenant={current_user.tenant_id}")
+
+    # Auto-trigger qualification call in background — does not block HTTP response
+    asyncio.create_task(_auto_trigger_qualification(lead_id, current_user.tenant_id))
+
     return _success(data=_serialize_lead(created), message="Lead created")
 
 
