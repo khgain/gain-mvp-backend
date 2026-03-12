@@ -1,0 +1,624 @@
+"""
+Documents API — physical files and logical docs management for a lead.
+
+All endpoints are scoped to the authenticated user's tenant.
+
+Endpoints:
+  GET  /leads/{id}/documents                          — all phys_files + logical_docs
+  GET  /leads/{id}/physical-files                     — list physical files only
+  GET  /leads/{id}/physical-files/{file_id}/view-url — presigned S3 view URL
+  POST /leads/{id}/physical-files/{file_id}/review   — human review (confirm/split/partial)
+  POST /leads/{id}/physical-files/{file_id}/reprocess — re-enqueue classification
+  GET  /leads/{id}/logical-docs                       — list logical docs with extraction + T1
+  GET  /leads/{id}/logical-docs/{doc_id}              — single logical doc (full data)
+  POST /leads/{id}/logical-docs/group                 — group physical files into one logical doc
+  POST /leads/{id}/logical-docs/{doc_id}/reject       — reject a logical doc
+  GET  /leads/{id}/download-zip                       — stream all approved docs as ZIP
+  POST /leads/{id}/upload                             — get presigned PUT URL for browser upload
+"""
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+from bson import ObjectId
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import Response
+
+from app.auth import get_current_user, CurrentUser, require_role
+from app.database import get_db
+from app.models.document import (
+    ReviewSubmitRequest,
+    GroupFilesRequest,
+    RejectDocRequest,
+    PhysicalFileResponse,
+    LogicalDocResponse,
+)
+from app.utils.logging import get_logger
+
+router = APIRouter(prefix="/leads", tags=["Documents"])
+logger = get_logger("routes.documents")
+
+
+def _success(data=None, message="Success"):
+    return {"success": True, "data": data, "message": message}
+
+
+def _not_found(what: str = "Document"):
+    raise HTTPException(status_code=404, detail=f"{what} not found")
+
+
+async def _get_lead_or_404(db, lead_id: str, tenant_id: str) -> dict:
+    lead = await db.leads.find_one({"_id": ObjectId(lead_id), "tenant_id": tenant_id})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return lead
+
+
+def _serialize_phys_file(doc: dict) -> dict:
+    d = {**doc}
+    d["id"] = str(doc["_id"])
+    d.pop("_id", None)
+    return d
+
+
+def _serialize_logical_doc(doc: dict) -> dict:
+    d = {**doc}
+    d["id"] = str(doc["_id"])
+    d.pop("_id", None)
+    return d
+
+
+# ---------------------------------------------------------------------------
+# GET /leads/{lead_id}/documents — combined overview
+# ---------------------------------------------------------------------------
+
+@router.get("/{lead_id}/documents")
+async def get_lead_documents(
+    lead_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Return all physical files and logical docs for a lead."""
+    db = get_db()
+    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    phys_files = []
+    async for doc in db.phys_files.find(
+        {"lead_id": lead_id, "tenant_id": current_user.tenant_id},
+        sort=[("created_at", -1)],
+    ):
+        phys_files.append(_serialize_phys_file(doc))
+
+    logical_docs = []
+    async for doc in db.logical_docs.find(
+        {"lead_id": lead_id, "tenant_id": current_user.tenant_id},
+        sort=[("created_at", 1)],
+    ):
+        logical_docs.append(_serialize_logical_doc(doc))
+
+    return _success({
+        "physical_files": phys_files,
+        "logical_docs": logical_docs,
+        "stats": {
+            "total_files": len(phys_files),
+            "total_logical_docs": len(logical_docs),
+            "needs_review": sum(1 for f in phys_files if f.get("status") == "NEEDS_HUMAN_REVIEW"),
+            "tier1_passed": sum(1 for d in logical_docs if d.get("status") == "TIER1_PASSED"),
+            "tier1_failed": sum(1 for d in logical_docs if d.get("status") == "TIER1_FAILED"),
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET /leads/{lead_id}/physical-files
+# ---------------------------------------------------------------------------
+
+@router.get("/{lead_id}/physical-files")
+async def list_physical_files(
+    lead_id: str,
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """List all physical files received for a lead."""
+    db = get_db()
+    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    query = {"lead_id": lead_id, "tenant_id": current_user.tenant_id}
+    if status_filter:
+        query["status"] = status_filter
+
+    files = []
+    async for doc in db.phys_files.find(query, sort=[("created_at", -1)]):
+        files.append(_serialize_phys_file(doc))
+
+    return _success({"files": files, "total": len(files)})
+
+
+# ---------------------------------------------------------------------------
+# GET /leads/{lead_id}/physical-files/{file_id}/view-url
+# ---------------------------------------------------------------------------
+
+@router.get("/{lead_id}/physical-files/{file_id}/view-url")
+async def get_file_view_url(
+    lead_id: str,
+    file_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Generate a 1-hour presigned S3 URL to view a physical file."""
+    db = get_db()
+    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    phys_file = await db.phys_files.find_one({
+        "_id": ObjectId(file_id),
+        "lead_id": lead_id,
+        "tenant_id": current_user.tenant_id,
+    })
+    if not phys_file:
+        _not_found("File")
+
+    from app.services.storage_service import generate_view_url
+    url = await generate_view_url(
+        s3_key=phys_file["s3_key"],
+        tenant_id=current_user.tenant_id,
+        lead_tenant_id=phys_file["tenant_id"],
+        expiry_seconds=3600,
+    )
+    return _success({"url": url, "expires_in_seconds": 3600})
+
+
+# ---------------------------------------------------------------------------
+# POST /leads/{lead_id}/physical-files/{file_id}/review — human review
+# ---------------------------------------------------------------------------
+
+@router.post("/{lead_id}/physical-files/{file_id}/review")
+async def submit_review(
+    lead_id: str,
+    file_id: str,
+    body: ReviewSubmitRequest,
+    current_user: CurrentUser = Depends(require_role("TENANT_ADMIN", "CAMPAIGN_MANAGER")),
+):
+    """
+    Submit a human review decision for an ambiguous physical file.
+
+    Decisions:
+      CONFIRM_SINGLE  — confirm this file is doc_type X, proceed to extraction
+      SPLIT_BUNDLED   — this file has multiple docs; split by page range
+      MARK_PARTIAL    — this is one part of a multi-page document
+    """
+    db = get_db()
+    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    phys_file = await db.phys_files.find_one({
+        "_id": ObjectId(file_id),
+        "lead_id": lead_id,
+        "tenant_id": current_user.tenant_id,
+    })
+    if not phys_file:
+        _not_found("File")
+
+    now = datetime.now(timezone.utc)
+
+    if body.decision.value == "CONFIRM_SINGLE":
+        # Create a logical doc and enqueue extraction
+        if not body.doc_type:
+            raise HTTPException(status_code=400, detail="doc_type required for CONFIRM_SINGLE")
+
+        result = await db.logical_docs.insert_one({
+            "lead_id": lead_id,
+            "tenant_id": current_user.tenant_id,
+            "doc_type": body.doc_type.value,
+            "assembly_type": "SINGLE",
+            "physical_file_ids": [file_id],
+            "completeness_status": "COMPLETE",
+            "is_mandatory": True,
+            "extracted_data": {},
+            "status": "READY_FOR_EXTRACTION",
+            "created_at": now,
+            "updated_at": now,
+        })
+        logical_doc_id = str(result.inserted_id)
+
+        # Update phys_file
+        await db.phys_files.update_one(
+            {"_id": ObjectId(file_id)},
+            {"$set": {
+                "status": "HUMAN_REVIEWED",
+                "ambiguity_type": "NORMAL",
+                "reviewer_id": current_user.id,
+                "reviewed_at": now,
+                "review_notes": body.notes,
+                "updated_at": now,
+            }, "$addToSet": {"logical_doc_ids": logical_doc_id}},
+        )
+
+        # Enqueue extraction
+        from app.workers.ai_worker import extract_document_data
+        extract_document_data.apply_async(
+            kwargs={"logical_doc_id": logical_doc_id, "tenant_id": current_user.tenant_id},
+            queue="ai-extraction",
+        )
+        return _success({"decision": "CONFIRM_SINGLE", "logical_doc_id": logical_doc_id}, "Review submitted")
+
+    elif body.decision.value == "SPLIT_BUNDLED":
+        # For each split definition, create a child PhysicalFile stub and LogicalDoc
+        if not body.splits:
+            raise HTTPException(status_code=400, detail="splits required for SPLIT_BUNDLED")
+
+        logical_doc_ids = []
+        for split in body.splits:
+            child_result = await db.logical_docs.insert_one({
+                "lead_id": lead_id,
+                "tenant_id": current_user.tenant_id,
+                "doc_type": split.doc_type.value,
+                "assembly_type": "EXTRACTED",
+                "physical_file_ids": [file_id],
+                "completeness_status": "COMPLETE",
+                "is_mandatory": True,
+                "extracted_data": {},
+                "page_range": split.page_range,  # stored for auditing
+                "status": "READY_FOR_EXTRACTION",
+                "created_at": now,
+                "updated_at": now,
+            })
+            logical_doc_ids.append(str(child_result.inserted_id))
+
+            from app.workers.ai_worker import extract_document_data
+            extract_document_data.apply_async(
+                kwargs={"logical_doc_id": str(child_result.inserted_id), "tenant_id": current_user.tenant_id},
+                queue="ai-extraction",
+            )
+
+        await db.phys_files.update_one(
+            {"_id": ObjectId(file_id)},
+            {"$set": {
+                "status": "HUMAN_REVIEWED",
+                "ambiguity_type": "BUNDLED",
+                "reviewer_id": current_user.id,
+                "reviewed_at": now,
+                "review_notes": body.notes,
+                "updated_at": now,
+            }, "$addToSet": {"logical_doc_ids": {"$each": logical_doc_ids}}},
+        )
+        return _success({"decision": "SPLIT_BUNDLED", "logical_doc_ids": logical_doc_ids}, "Review submitted")
+
+    elif body.decision.value == "MARK_PARTIAL":
+        await db.phys_files.update_one(
+            {"_id": ObjectId(file_id)},
+            {"$set": {
+                "status": "HUMAN_REVIEWED",
+                "ambiguity_type": "PARTIAL",
+                "reviewer_id": current_user.id,
+                "reviewed_at": now,
+                "review_notes": body.notes,
+                "updated_at": now,
+            }},
+        )
+        return _success({"decision": "MARK_PARTIAL"}, "Marked as partial document")
+
+    raise HTTPException(status_code=400, detail="Unknown review decision")
+
+
+# ---------------------------------------------------------------------------
+# POST /leads/{lead_id}/physical-files/{file_id}/reprocess
+# ---------------------------------------------------------------------------
+
+@router.post("/{lead_id}/physical-files/{file_id}/reprocess")
+async def reprocess_file(
+    lead_id: str,
+    file_id: str,
+    current_user: CurrentUser = Depends(require_role("TENANT_ADMIN", "CAMPAIGN_MANAGER")),
+):
+    """Re-enqueue a physical file for classification (useful after manual fixes)."""
+    db = get_db()
+    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    phys_file = await db.phys_files.find_one({
+        "_id": ObjectId(file_id),
+        "lead_id": lead_id,
+        "tenant_id": current_user.tenant_id,
+    })
+    if not phys_file:
+        _not_found("File")
+
+    now = datetime.now(timezone.utc)
+    await db.phys_files.update_one(
+        {"_id": ObjectId(file_id)},
+        {"$set": {"status": "RECEIVED", "updated_at": now}},
+    )
+
+    from app.workers.ai_worker import classify_document
+    classify_document.apply_async(
+        kwargs={"phys_file_id": file_id, "tenant_id": current_user.tenant_id},
+        queue="ai-classification",
+    )
+    return _success({"status": "reprocessing"}, "File queued for re-classification")
+
+
+# ---------------------------------------------------------------------------
+# GET /leads/{lead_id}/logical-docs
+# ---------------------------------------------------------------------------
+
+@router.get("/{lead_id}/logical-docs")
+async def list_logical_docs(
+    lead_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """List all logical documents with their extraction results and Tier 1 validation."""
+    db = get_db()
+    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    docs = []
+    async for doc in db.logical_docs.find(
+        {"lead_id": lead_id, "tenant_id": current_user.tenant_id},
+        sort=[("created_at", 1)],
+    ):
+        docs.append(_serialize_logical_doc(doc))
+
+    return _success({"docs": docs, "total": len(docs)})
+
+
+# ---------------------------------------------------------------------------
+# GET /leads/{lead_id}/logical-docs/{doc_id}
+# ---------------------------------------------------------------------------
+
+@router.get("/{lead_id}/logical-docs/{doc_id}")
+async def get_logical_doc(
+    lead_id: str,
+    doc_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Get a single logical document with full extracted data and validation results."""
+    db = get_db()
+    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    doc = await db.logical_docs.find_one({
+        "_id": ObjectId(doc_id),
+        "lead_id": lead_id,
+        "tenant_id": current_user.tenant_id,
+    })
+    if not doc:
+        _not_found("Logical document")
+
+    return _success(_serialize_logical_doc(doc))
+
+
+# ---------------------------------------------------------------------------
+# POST /leads/{lead_id}/logical-docs/group — group physical files
+# ---------------------------------------------------------------------------
+
+@router.post("/{lead_id}/logical-docs/group")
+async def group_physical_files(
+    lead_id: str,
+    body: GroupFilesRequest,
+    current_user: CurrentUser = Depends(require_role("TENANT_ADMIN", "CAMPAIGN_MANAGER")),
+):
+    """
+    Group multiple physical files (e.g. pages 1-6 and 7-12) into a single logical doc.
+    The ops team then confirms the doc_type via the review endpoint.
+    """
+    db = get_db()
+    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    file_ids = body.physical_file_ids
+    now = datetime.now(timezone.utc)
+
+    # Verify all files belong to this lead
+    count = await db.phys_files.count_documents({
+        "_id": {"$in": [ObjectId(fid) for fid in file_ids]},
+        "lead_id": lead_id,
+        "tenant_id": current_user.tenant_id,
+    })
+    if count != len(file_ids):
+        raise HTTPException(status_code=400, detail="One or more files not found for this lead")
+
+    # Create a grouped logical doc (type TBD by ops review)
+    result = await db.logical_docs.insert_one({
+        "lead_id": lead_id,
+        "tenant_id": current_user.tenant_id,
+        "doc_type": "OTHER",
+        "assembly_type": "MULTI_FILE",
+        "physical_file_ids": file_ids,
+        "completeness_status": "COMPLETE",
+        "is_mandatory": True,
+        "extracted_data": {},
+        "status": "NEEDS_HUMAN_REVIEW",
+        "created_at": now,
+        "updated_at": now,
+    })
+    logical_doc_id = str(result.inserted_id)
+
+    # Link all phys_files to this logical_doc
+    await db.phys_files.update_many(
+        {"_id": {"$in": [ObjectId(fid) for fid in file_ids]}},
+        {"$addToSet": {"logical_doc_ids": logical_doc_id}, "$set": {"updated_at": now}},
+    )
+
+    return _success({"logical_doc_id": logical_doc_id}, "Files grouped — please confirm doc type via review")
+
+
+# ---------------------------------------------------------------------------
+# POST /leads/{lead_id}/logical-docs/{doc_id}/reject
+# ---------------------------------------------------------------------------
+
+@router.post("/{lead_id}/logical-docs/{doc_id}/reject")
+async def reject_logical_doc(
+    lead_id: str,
+    doc_id: str,
+    body: RejectDocRequest,
+    current_user: CurrentUser = Depends(require_role("TENANT_ADMIN", "CAMPAIGN_MANAGER")),
+):
+    """Reject a logical document (e.g. unreadable, wrong document submitted)."""
+    db = get_db()
+    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    doc = await db.logical_docs.find_one({
+        "_id": ObjectId(doc_id),
+        "lead_id": lead_id,
+        "tenant_id": current_user.tenant_id,
+    })
+    if not doc:
+        _not_found("Logical document")
+
+    now = datetime.now(timezone.utc)
+    await db.logical_docs.update_one(
+        {"_id": ObjectId(doc_id)},
+        {"$set": {
+            "status": "REJECTED",
+            "rejection_reason": body.reason,
+            "updated_at": now,
+        }},
+    )
+
+    await db.activity_feed.insert_one({
+        "tenant_id": current_user.tenant_id,
+        "lead_id": lead_id,
+        "event_type": "DOCUMENT_REJECTED",
+        "message": f"Document {doc.get('doc_type', 'UNKNOWN')} rejected: {body.reason[:100]}",
+        "created_by": current_user.id,
+        "created_at": now,
+    })
+
+    return _success(None, "Document rejected")
+
+
+# ---------------------------------------------------------------------------
+# GET /leads/{lead_id}/download-zip — download all approved docs as ZIP
+# ---------------------------------------------------------------------------
+
+@router.get("/{lead_id}/download-zip")
+async def download_documents_zip(
+    lead_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Stream all Tier1-passed logical docs for this lead as a categorised ZIP.
+    Category folders: KYC, Financials, Business, Property.
+    """
+    db = get_db()
+    lead = await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    # Collect approved logical docs
+    files_to_zip = []
+    async for doc in db.logical_docs.find({
+        "lead_id": lead_id,
+        "tenant_id": current_user.tenant_id,
+        "status": {"$in": ["TIER1_PASSED", "HUMAN_REVIEWED"]},
+    }):
+        phys_file_ids = doc.get("physical_file_ids", [])
+        for fid in phys_file_ids:
+            pf = await db.phys_files.find_one({"_id": ObjectId(fid)})
+            if pf:
+                files_to_zip.append({
+                    "s3_key": pf["s3_key"],
+                    "doc_type": doc.get("doc_type", "OTHER"),
+                    "filename": pf.get("original_filename", "document.pdf"),
+                })
+
+    if not files_to_zip:
+        raise HTTPException(status_code=404, detail="No approved documents to download")
+
+    from app.services.storage_service import stream_zip_from_s3_files
+    zip_bytes = stream_zip_from_s3_files(files_to_zip)
+
+    company_safe = (lead.get("company_name", "lead") or "lead").replace(" ", "_")[:30]
+    filename = f"{company_safe}_documents.zip"
+
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /leads/{lead_id}/upload — get presigned PUT URL for browser direct upload
+# ---------------------------------------------------------------------------
+
+@router.post("/{lead_id}/upload")
+async def get_upload_url(
+    lead_id: str,
+    filename: str = Query(..., description="Original filename of the file to upload"),
+    content_type: str = Query(default="application/pdf"),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Return a presigned S3 PUT URL so the browser can upload a document directly.
+    After upload, call POST /leads/{id}/physical-files/confirm to register the file.
+    """
+    db = get_db()
+    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    from app.services.storage_service import build_s3_key, get_upload_presigned_url
+    s3_key = build_s3_key(current_user.tenant_id, lead_id, filename)
+    upload_url = await get_upload_presigned_url(s3_key, content_type)
+
+    return _success({
+        "upload_url": upload_url,
+        "s3_key": s3_key,
+        "filename": filename,
+        "expires_in_seconds": 3600,
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /leads/{lead_id}/physical-files/confirm — register a browser-uploaded file
+# ---------------------------------------------------------------------------
+
+@router.post("/{lead_id}/physical-files/confirm")
+async def confirm_portal_upload(
+    lead_id: str,
+    s3_key: str = Query(...),
+    filename: str = Query(...),
+    file_size_bytes: int = Query(default=0),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    After the browser has uploaded directly to S3 via presigned URL,
+    call this to register the file as a PhysicalFile record and trigger classification.
+    """
+    db = get_db()
+    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    now = datetime.now(timezone.utc)
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "other"
+    file_type_map = {"pdf": "PDF", "jpg": "JPG", "jpeg": "JPG", "png": "PNG", "zip": "ZIP"}
+    file_type = file_type_map.get(ext, "OTHER")
+    is_zip = file_type == "ZIP"
+
+    result = await db.phys_files.insert_one({
+        "lead_id": lead_id,
+        "tenant_id": current_user.tenant_id,
+        "original_filename": filename,
+        "channel_received": "PORTAL_UPLOAD",
+        "s3_key": s3_key,
+        "file_type": file_type,
+        "file_size_bytes": file_size_bytes,
+        "status": "EXTRACTING_ZIP" if is_zip else "RECEIVED",
+        "logical_doc_ids": [],
+        "created_at": now,
+        "updated_at": now,
+    })
+    phys_file_id = str(result.inserted_id)
+
+    await db.activity_feed.insert_one({
+        "tenant_id": current_user.tenant_id,
+        "lead_id": lead_id,
+        "event_type": "DOCUMENT_UPLOADED",
+        "message": f"Document uploaded via portal: {filename}",
+        "created_by": current_user.id,
+        "created_at": now,
+    })
+
+    if is_zip:
+        from app.workers.ai_worker import extract_zip
+        extract_zip.apply_async(
+            kwargs={"phys_file_id": phys_file_id, "tenant_id": current_user.tenant_id},
+            queue="zip",
+        )
+    else:
+        from app.workers.ai_worker import classify_document
+        classify_document.apply_async(
+            kwargs={"phys_file_id": phys_file_id, "tenant_id": current_user.tenant_id},
+            queue="ai-classification",
+        )
+
+    return _success({"phys_file_id": phys_file_id, "status": "queued"}, "File registered")

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pandoc --track-changes=all \"/Users/kashyapharlalka/Downloads/Gain_AI_MVP_PRD.docx\" -o /tmp/gain_prd.md)",
+      "Bash(python3 -c \":*)",
+      "Bash(.venv/bin/pip install -r requirements.txt)",
+      "Bash(pandoc \"/Users/kashyapharlalka/Downloads/Gain_AI_MVP_PRD_1.docx\" -t plain)",
+      "Bash(pandoc \"/Users/kashyapharlalka/Downloads/Gain_AI_MVP_PRD_1.docx\" -t markdown)"
+    ]
+  }
+}

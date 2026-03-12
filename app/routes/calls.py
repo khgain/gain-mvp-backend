@@ -1,0 +1,172 @@
+"""
+Calls and WhatsApp messages routes — PRD Section 6.2.
+
+GET /leads/:id/calls             — all call records, newest first
+GET /leads/:id/calls/:call_id    — one call with full transcript + extracted_fields
+GET /leads/:id/whatsapp-messages — full WhatsApp thread, oldest first (for chat window)
+
+All queries are scoped by tenant_id from JWT. Every record must belong to the
+requesting tenant before it is returned.
+"""
+from bson import ObjectId
+from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import Optional
+
+from app.auth import get_current_user, CurrentUser
+from app.database import get_db
+from app.utils.logging import get_logger
+
+router = APIRouter(tags=["Calls & Messages"])
+logger = get_logger("routes.calls")
+
+
+def _success(data=None, message="Success"):
+    return {"success": True, "data": data, "message": message}
+
+
+def _serialize_call(doc: dict, include_transcript: bool = True) -> dict:
+    """Convert a calls collection document to a serializable dict."""
+    result = {**doc}
+    result["id"] = str(doc["_id"])
+    result.pop("_id", None)
+    if result.get("tenant_id"):
+        result["tenant_id"] = str(result["tenant_id"])
+
+    # Serialize transcript timestamps
+    if not include_transcript:
+        result.pop("transcript", None)
+        result.pop("transcript_raw", None)
+
+    return result
+
+
+def _serialize_message(doc: dict) -> dict:
+    """Convert a whatsapp_messages collection document to a serializable dict."""
+    result = {**doc}
+    result["id"] = str(doc["_id"])
+    result.pop("_id", None)
+    if result.get("tenant_id"):
+        result["tenant_id"] = str(result["tenant_id"])
+    if result.get("physical_file_id"):
+        result["physical_file_id"] = str(result["physical_file_id"])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# GET /leads/:id/calls  — all call attempts for a lead
+# ---------------------------------------------------------------------------
+
+@router.get("/leads/{lead_id}/calls")
+async def list_calls(
+    lead_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Returns all call records for a lead, sorted newest first.
+
+    Each item includes: status, duration_seconds, qualification_outcome,
+    attempt_number, initiated_at, completed_at, ai_summary.
+    Transcript content is excluded from the list — use the detail endpoint.
+    """
+    db = get_db()
+
+    # Verify lead exists and belongs to this tenant
+    try:
+        lead_oid = ObjectId(lead_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid lead ID")
+
+    lead = await db.leads.find_one({"_id": lead_oid, "tenant_id": current_user.tenant_id})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    calls = await db.calls.find(
+        {"lead_id": lead_id, "tenant_id": current_user.tenant_id}
+    ).sort("initiated_at", -1).to_list(100)
+
+    data = [_serialize_call(c, include_transcript=False) for c in calls]
+    logger.info(f"List calls — lead_id={lead_id} count={len(data)}")
+    return _success(data=data, message=f"{len(data)} call(s) found")
+
+
+# ---------------------------------------------------------------------------
+# GET /leads/:id/calls/:call_id  — single call with full transcript
+# ---------------------------------------------------------------------------
+
+@router.get("/leads/{lead_id}/calls/{call_id}")
+async def get_call(
+    lead_id: str,
+    call_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Returns one call record with the full structured transcript array
+    and Claude-extracted fields.
+
+    Frontend uses this for the transcript viewer (chat-style bubble UI).
+    If recording_url is present, show an audio player.
+    Extracted data panel shows: qualification_outcome, extracted_fields, ai_summary.
+    """
+    db = get_db()
+
+    try:
+        call_oid = ObjectId(call_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid call ID")
+
+    call = await db.calls.find_one(
+        {
+            "_id": call_oid,
+            "lead_id": lead_id,
+            "tenant_id": current_user.tenant_id,
+        }
+    )
+    if not call:
+        raise HTTPException(status_code=404, detail="Call record not found")
+
+    return _success(data=_serialize_call(call, include_transcript=True))
+
+
+# ---------------------------------------------------------------------------
+# GET /leads/:id/whatsapp-messages  — full WhatsApp thread for a lead
+# ---------------------------------------------------------------------------
+
+@router.get("/leads/{lead_id}/whatsapp-messages")
+async def list_whatsapp_messages(
+    lead_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Returns the full WhatsApp message thread for a lead, sorted oldest first
+    (so the frontend can render it as a chat window, with oldest messages at top).
+
+    Includes all fields needed to render:
+      - direction (INBOUND/OUTBOUND) — which side of the bubble
+      - message_type (TEXT/DOCUMENT/IMAGE/TEMPLATE)
+      - content — text body
+      - media info (s3_key, filename, mime_type) — for file card inside bubble
+      - template_name — shown as badge for template messages
+      - status (SENT/DELIVERED/READ/FAILED/RECEIVED) — delivery status icon
+      - sent_at — message timestamp
+
+    Note: media files are NOT returned as content. Frontend calls
+    GET /leads/:id/documents/:file_id/view to get a presigned URL for viewing.
+    """
+    db = get_db()
+
+    try:
+        lead_oid = ObjectId(lead_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid lead ID")
+
+    lead = await db.leads.find_one({"_id": lead_oid, "tenant_id": current_user.tenant_id})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    messages = await db.whatsapp_messages.find(
+        {"lead_id": lead_id, "tenant_id": current_user.tenant_id}
+    ).sort("sent_at", 1).to_list(500)
+
+    data = [_serialize_message(m) for m in messages]
+    logger.info(f"List WhatsApp messages — lead_id={lead_id} count={len(data)}")
+    return _success(data=data, message=f"{len(data)} message(s) found")
