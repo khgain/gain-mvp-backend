@@ -42,36 +42,25 @@ def _success(data=None, message="Success"):
 
 async def _auto_trigger_qualification(lead_id: str, tenant_id: str) -> None:
     """
-    Fire the qualification call automatically after lead creation.
-    Tries Celery/SQS first; falls back to a direct ElevenLabs API call
-    so it works even when SQS workers are not deployed yet.
+    Fire the ElevenLabs qualification call directly after lead creation.
+
+    Bypasses Celery entirely — asyncio.run() inside a Celery eager task conflicts
+    with FastAPI's running event loop. Direct call is simpler and equally reliable
+    for the single-process Railway deployment.
     """
     try:
-        from app.services.voice_service import enqueue_qualification_call
-        await enqueue_qualification_call(lead_id, tenant_id)
-        logger.info(f"[AUTO-TRIGGER] Qualification call enqueued (Celery) — lead_id={lead_id}")
-    except Exception as celery_exc:
-        logger.warning(
-            f"[AUTO-TRIGGER] Celery enqueue failed for lead_id={lead_id}: {celery_exc}. "
-            "Falling back to direct ElevenLabs call."
-        )
-        try:
-            from app.services.voice_service import trigger_outbound_call
-            conv_id = await trigger_outbound_call(lead_id, tenant_id)
-            if conv_id:
-                logger.info(
-                    f"[AUTO-TRIGGER] Direct call placed — lead_id={lead_id} conv_id={conv_id}"
-                )
-            else:
-                logger.warning(
-                    f"[AUTO-TRIGGER] Direct call skipped (ElevenLabs not configured) "
-                    f"— lead_id={lead_id}"
-                )
-        except Exception as direct_exc:
-            logger.error(
-                f"[AUTO-TRIGGER] Both Celery and direct call failed for lead_id={lead_id}: "
-                f"{direct_exc}"
+        from app.services.voice_service import trigger_outbound_call
+        conv_id = await trigger_outbound_call(lead_id, tenant_id)
+        if conv_id:
+            logger.info(
+                f"[AUTO-TRIGGER] Call placed — lead_id={lead_id} conv_id={conv_id}"
             )
+        else:
+            logger.warning(
+                f"[AUTO-TRIGGER] Call skipped (ElevenLabs not configured) — lead_id={lead_id}"
+            )
+    except Exception as exc:
+        logger.error(f"[AUTO-TRIGGER] Call failed for lead_id={lead_id}: {exc}")
 
 
 def _mask_pan(pan: str) -> str:
