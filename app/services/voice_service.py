@@ -234,6 +234,22 @@ async def process_call_completed(payload: dict) -> None:
         f"duration_seconds={duration_seconds} transcript_entries={len(raw_transcript)}"
     )
 
+    # If webhook didn't include transcript, fetch it from ElevenLabs API
+    if not raw_transcript and conversation_id and settings.ELEVENLABS_API_KEY:
+        logger.info(f"[VOICE] No transcript in webhook payload — fetching from ElevenLabs API for conv={conversation_id}")
+        try:
+            fetched = await _fetch_conversation_details(conversation_id)
+            if fetched:
+                raw_transcript = fetched.get("transcript", [])
+                if not duration_seconds:
+                    duration_seconds = int(fetched.get("metadata", {}).get("call_duration_secs", 0) or 0)
+                # Also grab analysis if available
+                if not data.get("analysis"):
+                    data["analysis"] = fetched.get("analysis", {})
+                logger.info(f"[VOICE] Fetched transcript from API — {len(raw_transcript)} entries, duration={duration_seconds}s")
+        except Exception as exc:
+            logger.error(f"[VOICE] Failed to fetch transcript from ElevenLabs API: {exc}")
+
     # Normalize transcript
     normalized_transcript = []
     transcript_text_lines = []
@@ -449,6 +465,47 @@ TRANSCRIPT:
     except Exception as exc:
         logger.error(f"[VOICE] Claude extraction error: {exc}")
         return {}, "INCOMPLETE"
+
+
+# ---------------------------------------------------------------------------
+# ElevenLabs API — fetch conversation details (transcript, analysis)
+# ---------------------------------------------------------------------------
+
+async def _fetch_conversation_details(conversation_id: str) -> Optional[dict]:
+    """
+    Fetch full conversation details from ElevenLabs API.
+    GET /v1/convai/conversations/{conversation_id}
+    Returns dict with transcript, analysis, metadata, etc.
+    """
+    if not settings.ELEVENLABS_API_KEY:
+        return None
+
+    url = f"{ELEVENLABS_BASE_URL}/convai/conversations/{conversation_id}"
+    headers = {
+        "xi-api-key": settings.ELEVENLABS_API_KEY,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+        logger.info(
+            f"[VOICE] Fetched conversation details — conv_id={conversation_id} "
+            f"keys={list(data.keys())}"
+        )
+        return data
+
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            f"[VOICE] ElevenLabs conversation fetch failed: "
+            f"{exc.response.status_code} — {exc.response.text[:200]}"
+        )
+        return None
+    except Exception as exc:
+        logger.error(f"[VOICE] _fetch_conversation_details error: {exc}")
+        return None
 
 
 # ---------------------------------------------------------------------------
