@@ -51,7 +51,43 @@ async def get_doc_collection_config(db, tenant_id: str) -> dict:
     )
     if agent and agent.get("config"):
         return agent["config"]
-    return {"doc_checklist_by_entity_type": {}}
+    # Sensible Indian SME lending defaults when no agent config exists
+    return {
+        "doc_checklist_by_entity_type": {
+            "PROPRIETORSHIP": {
+                "required": ["Aadhaar Card (front & back)", "PAN Card", "Bank Statement (last 12 months)", "Latest ITR with computation", "GST Certificate"],
+                "optional": ["UDYAM Registration Certificate", "Office Address Proof"],
+            },
+            "PARTNERSHIP": {
+                "required": ["Aadhaar Card of all partners", "PAN Card of firm and partners", "Partnership Deed", "Bank Statement (last 12 months)", "Latest 2 years ITR / Audited P&L", "GST Certificate"],
+                "optional": ["GST Returns (last 6 months)"],
+            },
+            "PRIVATE_LIMITED": {
+                "required": ["Aadhaar + PAN of all directors", "Certificate of Incorporation (COI)", "MOA + AOA", "Bank Statement (last 12 months)", "Audited P&L + Balance Sheet (2 years)", "GST Certificate"],
+                "optional": ["GST Returns (last 6 months)"],
+            },
+            "INDIVIDUAL": {
+                "required": ["Aadhaar Card", "PAN Card", "Bank Statement (last 12 months)", "Latest ITR", "Address Proof"],
+                "optional": [],
+            },
+        },
+        "whatsapp_checklist_template": (
+            "Hello {{borrower_name}} ji! 👋\n\n"
+            "Thank you for your {{loan_type}} application with Gain AI.\n\n"
+            "Please send the following documents to continue your application:\n\n"
+            "{{doc_list}}\n\n"
+            "You can send documents one by one or all at once as a ZIP file.\n"
+            "Reply HELP if you need assistance."
+        ),
+        "email_subject_template": "Documents Required — {{loan_type}} Application for {{company_name}}",
+        "email_body_template": (
+            "Dear {{borrower_name}},\n\n"
+            "Thank you for your loan application. To proceed, please share the following documents:\n\n"
+            "{{doc_list}}\n\n"
+            "You can reply to this email with the documents attached.\n\n"
+            "Regards,\nGain AI Operations Team"
+        ),
+    }
 
 
 async def check_all_required_docs_passed(
