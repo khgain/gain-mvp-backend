@@ -279,9 +279,25 @@ async def process_call_completed(payload: dict) -> None:
     analysis = data.get("analysis", {}) or {}
     el_data_collection = analysis.get("data_collection_results", {}) or {}
     if el_data_collection and not extracted_data:
-        extracted_data = {
+        raw_el = {
             k: v.get("value") for k, v in el_data_collection.items() if isinstance(v, dict)
         }
+        # Map ElevenLabs field names to our standard schema
+        extracted_data = {
+            "declaredTurnover": raw_el.get("ANNUAL_TURNOVER") or raw_el.get("annual_turnover") or raw_el.get("declaredTurnover", ""),
+            "businessVintage": raw_el.get("BUSINESS_VINTAGE") or raw_el.get("business_vintage") or raw_el.get("businessVintage", ""),
+            "existingEmis": raw_el.get("EXISTING_EMIS") or raw_el.get("existing_emis") or raw_el.get("existingEmis", ""),
+            "consentGiven": str(raw_el.get("CONSENT_GIVEN") or raw_el.get("consent_given") or "").lower() in ("yes", "true", "1"),
+            "loanPurpose": raw_el.get("LOAN_PURPOSE") or raw_el.get("loan_purpose") or raw_el.get("loanPurpose", ""),
+            "callSummary": raw_el.get("CALL_SUMMARY") or raw_el.get("call_summary") or "",
+        }
+        logger.info(f"[VOICE] Using ElevenLabs analysis data as fallback: {list(raw_el.keys())}")
+
+        # If ElevenLabs returned substantive data and call completed, override INCOMPLETE
+        has_data = any(v for k, v in extracted_data.items() if k != "consentGiven" and v)
+        if has_data and qualification_outcome == "INCOMPLETE" and elevenlabs_status not in ("no_answer", "failed", "busy", "error"):
+            qualification_outcome = "QUALIFIED"
+            logger.info(f"[VOICE] Upgraded outcome to QUALIFIED based on ElevenLabs analysis data")
 
     if elevenlabs_status in ("no_answer", "failed", "busy", "error"):
         qualification_outcome = "INCOMPLETE"
@@ -322,17 +338,25 @@ async def process_call_completed(payload: dict) -> None:
         })
 
     from bson import ObjectId
+    # Flatten qualification_result so frontend can read fields directly
+    qual_result = {
+        "outcome": qualification_outcome,
+        "call_transcript": transcript_raw,
+        "declared_turnover": extracted_data.get("declaredTurnover") or extracted_data.get("declared_turnover", ""),
+        "business_vintage": extracted_data.get("businessVintage") or extracted_data.get("business_vintage", ""),
+        "existing_emis": extracted_data.get("existingEmis") or extracted_data.get("existing_emis", ""),
+        "consent_given": extracted_data.get("consentGiven") if isinstance(extracted_data.get("consentGiven"), bool) else str(extracted_data.get("consentGiven", "")).lower() in ("yes", "true", "1"),
+        "loan_purpose": extracted_data.get("loanPurpose") or extracted_data.get("loan_purpose", ""),
+        "call_summary": ai_summary,
+        "key_data": extracted_data,  # keep raw data too
+    }
     await db.leads.update_one(
         {"_id": ObjectId(lead_id)},
         {
             "$set": {
                 "status": new_lead_status,
                 "updated_at": now,
-                "qualification_result": {
-                    "outcome": qualification_outcome,
-                    "call_transcript": transcript_raw,
-                    "key_data": extracted_data,
-                },
+                "qualification_result": qual_result,
             }
         },
     )
