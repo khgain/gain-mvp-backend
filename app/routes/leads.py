@@ -383,6 +383,82 @@ async def trigger_agent(
     return _success(message=message)
 
 
+@router.post("/{lead_id}/trigger-follow-up")
+async def trigger_follow_up(
+    lead_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Manually trigger follow-up reminders for a lead (for demo purposes)."""
+    db = get_db()
+    try:
+        oid = ObjectId(lead_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid lead ID")
+    lead = await db.leads.find_one({"_id": oid, "tenant_id": current_user.tenant_id})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    now = datetime.now(timezone.utc)
+    results = {"whatsapp": False, "email": False}
+
+    # Send WhatsApp reminder
+    try:
+        from app.utils.encryption import decrypt_field
+        mobile_raw = decrypt_field(lead.get("mobile", ""))
+        borrower_name = lead.get("name", "Borrower")
+        company_name = lead.get("company_name", borrower_name)
+
+        if mobile_raw:
+            from app.services.whatsapp_service import send_reminder
+            results["whatsapp"] = await send_reminder(
+                lead_id=lead_id,
+                mobile=mobile_raw,
+                name=borrower_name,
+                day=1,
+                missing_count=3,  # placeholder count for demo
+            )
+    except Exception as exc:
+        logger.warning(f"Manual follow-up WhatsApp failed for lead_id={lead_id}: {exc}")
+
+    # Send email reminder
+    try:
+        borrower_email = lead.get("email", "")
+        if borrower_email:
+            from app.services.email_service import send_reminder_email
+            results["email"] = await send_reminder_email(
+                lead_id=lead_id,
+                borrower_name=lead.get("name", "Borrower"),
+                borrower_email=borrower_email,
+                company_name=lead.get("company_name", ""),
+                pending_docs=["Bank Statement", "ITR", "PAN Card"],
+                day=1,
+            )
+    except Exception as exc:
+        logger.warning(f"Manual follow-up email failed for lead_id={lead_id}: {exc}")
+
+    # Log activity
+    channels = []
+    if results["whatsapp"]:
+        channels.append("WhatsApp")
+    if results["email"]:
+        channels.append("Email")
+    channel_str = " + ".join(channels) if channels else "None (services not configured)"
+
+    await db.activity_feed.insert_one({
+        "tenant_id": current_user.tenant_id,
+        "lead_id": lead_id,
+        "event_type": "FOLLOW_UP_TRIGGERED",
+        "message": f"Manual follow-up triggered by {current_user.email} via {channel_str}",
+        "created_by": current_user.user_id,
+        "created_at": now,
+    })
+
+    return _success(
+        data=results,
+        message=f"Follow-up sent via {channel_str}",
+    )
+
+
 @router.post("/{lead_id}/override")
 async def override_lead(
     lead_id: str,
