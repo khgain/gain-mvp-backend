@@ -337,10 +337,14 @@ async def process_call_completed(payload: dict) -> None:
         f"outcome={qualification_outcome} status={new_lead_status}"
     )
 
-    # Trigger doc collection if QUALIFIED
-    if new_lead_status == "QUALIFIED":
-        logger.info(f"[VOICE] Lead QUALIFIED -- triggering doc checklist for lead_id={lead_id}")
-        _trigger_doc_collection(lead_id, tenant_id)
+    # Trigger next workflow step (doc collection if QUALIFIED)
+    if new_lead_status in ("QUALIFIED", "NOT_QUALIFIED"):
+        logger.info(f"[VOICE] Call processed — invoking workflow engine for lead_id={lead_id} status={new_lead_status}")
+        try:
+            from app.services.workflow_engine import process_lead
+            await process_lead(lead_id, tenant_id)
+        except Exception as exc:
+            logger.error(f"[VOICE] Workflow engine failed for lead_id={lead_id}: {exc}")
 
 
 async def process_call_status_update(payload: dict) -> None:

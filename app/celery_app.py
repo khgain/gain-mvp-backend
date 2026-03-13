@@ -4,6 +4,12 @@ from celery import Celery
 # Celery app uses SQS as broker.
 # For local development WITHOUT SQS, set CELERY_TASK_ALWAYS_EAGER=true in .env —
 # tasks run synchronously in the same process (no workers or queues needed).
+#
+# When CELERY_TASK_ALWAYS_EAGER=true, tasks run inside the FastAPI event loop.
+# Since workers use asyncio.run(), we apply nest_asyncio to allow nested loops.
+# Replace with a proper Celery worker process in production.
+import nest_asyncio
+nest_asyncio.apply()
 
 celery_app = Celery("gain")
 
@@ -52,6 +58,14 @@ celery_app.conf.update(
     # One message at a time per worker process
     worker_prefetch_multiplier=1,
     task_track_started=True,
+    # Celery Beat schedule — periodic tasks
+    beat_schedule={
+        "follow-up-hourly": {
+            "task": "tasks.run_follow_up_check",
+            "schedule": 3600.0,  # every hour
+            "options": {"queue": "whatsapp"},
+        },
+    },
 )
 
 # Auto-discover tasks in workers package
