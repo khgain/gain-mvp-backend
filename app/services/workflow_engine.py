@@ -72,7 +72,7 @@ async def _trigger_qualification_call(lead: dict, db) -> None:
 
 
 async def _trigger_doc_collection(lead: dict, db) -> None:
-    """Trigger WhatsApp + Email doc checklist directly (no Celery indirection)."""
+    """Trigger WhatsApp + Email doc checklist using direct service calls."""
     lead_id = str(lead["_id"])
     tenant_id = lead["tenant_id"]
     now = datetime.now(timezone.utc)
@@ -83,25 +83,86 @@ async def _trigger_doc_collection(lead: dict, db) -> None:
         {"$set": {"status": "DOC_COLLECTION", "updated_at": now}},
     )
 
-    # --- Send WhatsApp checklist directly (bypass Celery eager mode issues) ---
+    borrower_name = lead.get("name", "Borrower")
+    entity_type = lead.get("entity_type", "INDIVIDUAL")
+    loan_amount = lead.get("loan_amount_requested", 0)
+
+    # --- Send WhatsApp checklist (same pattern as working follow-up button) ---
     wa_sent = False
     try:
-        from app.workers.whatsapp_worker import _send_checklist_async
-        result = await _send_checklist_async(lead_id, tenant_id)
-        wa_sent = result.get("status") == "sent"
-        logger.info(f"WhatsApp checklist result for lead_id={lead_id}: {result}")
+        from app.utils.encryption import decrypt_field
+        mobile_raw = decrypt_field(lead.get("mobile", ""))
+        if mobile_raw:
+            from app.services.whatsapp_service import send_document_checklist, compute_mobile_hash
+            wa_sent = await send_document_checklist(
+                lead_id=lead_id,
+                mobile=mobile_raw,
+                name=borrower_name,
+                entity_type=entity_type,
+                loan_amount_paise=loan_amount,
+            )
+            # Store mobile_hash for inbound WA matching
+            mobile_hash = compute_mobile_hash(mobile_raw)
+            await db.leads.update_one(
+                {"_id": lead["_id"]},
+                {"$set": {"mobile_hash": mobile_hash}},
+            )
+            logger.info(f"WhatsApp checklist sent={wa_sent} for lead_id={lead_id}")
+        else:
+            logger.warning(f"No mobile number for lead_id={lead_id} — skipping WhatsApp")
     except Exception as exc:
         logger.error(f"WhatsApp checklist failed for lead_id={lead_id}: {exc}", exc_info=True)
 
-    # --- Send Email checklist directly ---
+    # --- Send Email checklist ---
     email_sent = False
     try:
-        from app.workers.whatsapp_worker import _send_email_checklist_async
-        result = await _send_email_checklist_async(lead_id, tenant_id)
-        email_sent = result.get("status") == "sent"
-        logger.info(f"Email checklist result for lead_id={lead_id}: {result}")
+        borrower_email = lead.get("email", "")
+        if borrower_email:
+            from app.services.email_service import send_document_checklist_email
+            from app.services.validation_rules import get_doc_collection_config
+
+            config = await get_doc_collection_config(db, tenant_id)
+            entity_checklist = config.get("doc_checklist_by_entity_type", {}).get(
+                entity_type, config.get("doc_checklist_by_entity_type", {}).get("INDIVIDUAL", {})
+            )
+            all_docs = entity_checklist.get("required", []) + [
+                f"{d} (optional)" for d in entity_checklist.get("optional", [])
+            ]
+
+            subject_template = config.get(
+                "email_subject_template",
+                "Documents Required — {{loan_type}} Application for {{company_name}}",
+            )
+            body_template = config.get(
+                "email_body_template",
+                "Dear {{borrower_name}},\n\nPlease send the following documents:\n\n{{doc_list}}\n\nRegards,\nGain AI",
+            )
+
+            email_sent = await send_document_checklist_email(
+                lead_id=lead_id,
+                tenant_id=tenant_id,
+                borrower_name=borrower_name,
+                borrower_email=borrower_email,
+                company_name=lead.get("company_name", ""),
+                loan_type=lead.get("loan_type", ""),
+                doc_list=all_docs,
+                subject_template=subject_template,
+                body_template=body_template,
+            )
+            logger.info(f"Email checklist sent={email_sent} for lead_id={lead_id}")
+        else:
+            logger.warning(f"No email for lead_id={lead_id} — skipping email")
     except Exception as exc:
         logger.error(f"Email checklist failed for lead_id={lead_id}: {exc}", exc_info=True)
+
+    # Log activity
+    await db.activity_feed.insert_one({
+        "tenant_id": tenant_id,
+        "lead_id": lead_id,
+        "event_type": "DOC_COLLECTION_STARTED",
+        "message": f"Doc collection started — WhatsApp={'sent' if wa_sent else 'failed'}, Email={'sent' if email_sent else 'failed'}",
+        "created_at": now,
+    })
 
     # Create workflow run record
     await db.workflow_runs.insert_one(
@@ -112,7 +173,7 @@ async def _trigger_doc_collection(lead: dict, db) -> None:
             "node_id": "doc_collection",
             "node_type": "DOC_COLLECTION",
             "status": "RUNNING",
-            "input_data": {"entity_type": lead.get("entity_type"), "loan_type": lead.get("loan_type")},
+            "input_data": {"entity_type": entity_type, "loan_type": lead.get("loan_type")},
             "output_data": {"whatsapp_sent": wa_sent, "email_sent": email_sent},
             "triggered_by": "SYSTEM",
             "executed_at": now,
