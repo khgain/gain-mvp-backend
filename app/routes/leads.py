@@ -13,6 +13,7 @@ POST   /leads/{id}/log-action       — log a manual action
 GET    /leads/{id}/timeline         — workflow run history for a lead
 GET    /leads/{id}/validation       — Tier 1 + Tier 2 validation results
 """
+import os
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Optional
@@ -457,6 +458,52 @@ async def trigger_follow_up(
         data=results,
         message=f"Follow-up sent via {channel_str}",
     )
+
+
+@router.get("/debug/connectivity")
+async def debug_connectivity(
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Diagnostic endpoint — test WAHA and SendGrid connectivity."""
+    from app.config import settings
+    import httpx
+
+    results = {
+        "waha_base_url": settings.WAHA_BASE_URL or "(not set)",
+        "waha_api_key_set": bool(settings.WAHA_API_KEY),
+        "sendgrid_api_key_set": bool(settings.SENDGRID_API_KEY),
+        "anthropic_api_key_set": bool(settings.ANTHROPIC_API_KEY),
+        "celery_eager": os.getenv("CELERY_TASK_ALWAYS_EAGER", "false"),
+        "waha_status": "not_configured",
+        "sendgrid_status": "not_configured",
+    }
+
+    # Test WAHA connectivity
+    if settings.WAHA_BASE_URL and settings.WAHA_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{settings.WAHA_BASE_URL.rstrip('/')}/api/sessions",
+                    headers={"X-Api-Key": settings.WAHA_API_KEY},
+                )
+                results["waha_status"] = f"HTTP {resp.status_code}"
+                results["waha_sessions"] = resp.json() if resp.status_code == 200 else resp.text[:200]
+        except Exception as exc:
+            results["waha_status"] = f"error: {exc}"
+
+    # Test SendGrid (just verify API key works)
+    if settings.SENDGRID_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.sendgrid.com/v3/user/profile",
+                    headers={"Authorization": f"Bearer {settings.SENDGRID_API_KEY}"},
+                )
+                results["sendgrid_status"] = f"HTTP {resp.status_code}"
+        except Exception as exc:
+            results["sendgrid_status"] = f"error: {exc}"
+
+    return _success(data=results, message="Connectivity check complete")
 
 
 @router.post("/{lead_id}/override")
