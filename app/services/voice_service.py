@@ -200,7 +200,11 @@ async def process_call_completed(payload: dict) -> None:
         logger.warning("[VOICE] process_call_completed: no conversation_id in payload")
         return
 
-    logger.info(f"[VOICE] Processing completed call -- conversation_id={conversation_id}")
+    # Log full payload structure for debugging
+    logger.info(
+        f"[VOICE] Processing completed call -- conversation_id={conversation_id} "
+        f"payload_keys={list(payload.keys())} data_keys={list(data.keys() if isinstance(data, dict) else [])}"
+    )
 
     call_record = await db.call_records.find_one({"conversation_id": conversation_id})
     metadata = data.get("metadata", {}) or {}
@@ -214,6 +218,14 @@ async def process_call_completed(payload: dict) -> None:
     raw_transcript = data.get("transcript", [])
     duration_seconds = int(data.get("duration", 0) or 0)
     elevenlabs_status = data.get("status", "completed")
+
+    # Normalise ElevenLabs status — they use both "completed" and "done"
+    COMPLETED_STATUSES = {"completed", "done", "success"}
+
+    logger.info(
+        f"[VOICE] Call details -- lead_id={lead_id} elevenlabs_status={elevenlabs_status!r} "
+        f"duration_seconds={duration_seconds} transcript_entries={len(raw_transcript)}"
+    )
 
     # Normalize transcript
     normalized_transcript = []
@@ -248,10 +260,10 @@ async def process_call_completed(payload: dict) -> None:
             k: v.get("value") for k, v in el_data_collection.items() if isinstance(v, dict)
         }
 
-    if elevenlabs_status in ("no_answer", "failed", "busy"):
+    if elevenlabs_status in ("no_answer", "failed", "busy", "error"):
         qualification_outcome = "INCOMPLETE"
 
-    if elevenlabs_status == "completed" and qualification_outcome == "QUALIFIED":
+    if elevenlabs_status in COMPLETED_STATUSES and qualification_outcome == "QUALIFIED":
         new_lead_status = "QUALIFIED"
     elif qualification_outcome in ("NOT_QUALIFIED", "REJECTED"):
         new_lead_status = "NOT_QUALIFIED"
@@ -262,7 +274,7 @@ async def process_call_completed(payload: dict) -> None:
 
     call_update = {
         "elevenlabs_call_result": elevenlabs_status,
-        "status": "COMPLETED" if elevenlabs_status == "completed" else "FAILED",
+        "status": "COMPLETED" if elevenlabs_status in COMPLETED_STATUSES else "FAILED",
         "transcript": normalized_transcript,
         "transcript_raw": transcript_raw,
         "extracted_data": extracted_data,
@@ -448,10 +460,17 @@ async def _get_decrypted_mobile(lead: dict) -> Optional[str]:
 def _format_e164(mobile: str) -> str:
     """Format an Indian mobile number to E.164 (+91XXXXXXXXXX)."""
     digits = "".join(c for c in mobile if c.isdigit())
+    # Already in full international format: +91XXXXXXXXXX (12 digits)
     if digits.startswith("91") and len(digits) == 12:
         return f"+{digits}"
+    # Standard 10-digit Indian mobile (no country code)
     if len(digits) == 10:
         return f"+91{digits}"
+    # 11-digit with leading 0 (e.g. 09876543210 → +919876543210)
+    if digits.startswith("0") and len(digits) == 11:
+        return f"+91{digits[1:]}"
+    # Fallback — return as-is with + prefix
+    logger.warning(f"[VOICE] Unexpected mobile number format: {digits!r} (len={len(digits)})")
     return f"+{digits}"
 
 
