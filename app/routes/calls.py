@@ -170,3 +170,78 @@ async def list_whatsapp_messages(
     data = [_serialize_message(m) for m in messages]
     logger.info(f"List WhatsApp messages — lead_id={lead_id} count={len(data)}")
     return _success(data=data, message=f"{len(data)} message(s) found")
+
+
+# ---------------------------------------------------------------------------
+# GET /leads/:id/emails  — email activity for a lead
+# ---------------------------------------------------------------------------
+
+@router.get("/leads/{lead_id}/emails")
+async def list_email_messages(
+    lead_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Returns email exchanges for a lead:
+    - Inbound emails from borrower (from activity_feed + email_messages collection)
+    - Sorted newest first for timeline display
+    """
+    db = get_db()
+
+    try:
+        lead_oid = ObjectId(lead_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid lead ID")
+
+    lead = await db.leads.find_one({"_id": lead_oid, "tenant_id": current_user.tenant_id})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    # Pull email-related activity feed events
+    feed_events = await db.activity_feed.find(
+        {
+            "lead_id": lead_id,
+            "tenant_id": current_user.tenant_id,
+            "event_type": {"$in": ["EMAIL_RECEIVED", "EMAIL_SENT", "EMAIL_ATTACHMENT_PROCESSED"]},
+        }
+    ).sort("created_at", -1).to_list(200)
+
+    # Pull from email_messages collection if it exists
+    email_msgs = await db.email_messages.find(
+        {"lead_id": lead_id, "tenant_id": current_user.tenant_id}
+    ).sort("received_at", -1).to_list(200)
+
+    # Normalize activity feed events
+    emails = []
+    for ev in feed_events:
+        emails.append({
+            "id": str(ev["_id"]),
+            "direction": "INBOUND" if ev["event_type"] == "EMAIL_RECEIVED" else "OUTBOUND",
+            "event_type": ev.get("event_type", ""),
+            "subject": ev.get("subject", "(no subject)"),
+            "from_email": ev.get("from_email", lead.get("email", "")),
+            "body_preview": ev.get("message", ""),
+            "attachments": ev.get("attachments", []),
+            "timestamp": ev["created_at"].isoformat() if hasattr(ev.get("created_at"), "isoformat") else str(ev.get("created_at", "")),
+            "source": "activity_feed",
+        })
+
+    # Normalize email_messages docs
+    for em in email_msgs:
+        emails.append({
+            "id": str(em["_id"]),
+            "direction": em.get("direction", "INBOUND"),
+            "event_type": "EMAIL_RECEIVED",
+            "subject": em.get("subject", "(no subject)"),
+            "from_email": em.get("from_email", lead.get("email", "")),
+            "body_preview": em.get("body_text", em.get("body_preview", "")),
+            "attachments": em.get("attachments", []),
+            "timestamp": em["received_at"].isoformat() if hasattr(em.get("received_at"), "isoformat") else str(em.get("received_at", "")),
+            "source": "email_messages",
+        })
+
+    # Sort combined list by timestamp descending
+    emails.sort(key=lambda x: x["timestamp"], reverse=True)
+
+    logger.info(f"List emails — lead_id={lead_id} count={len(emails)}")
+    return _success(data=emails, message=f"{len(emails)} email(s) found")

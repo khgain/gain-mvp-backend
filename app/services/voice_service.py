@@ -88,6 +88,7 @@ async def trigger_outbound_call(lead_id: str, tenant_id: str) -> Optional[str]:
     company_name = lead.get("company_name", "your business")
     loan_amount = lead.get("loan_amount_requested", 0)
     loan_amount_str = f"Rs.{loan_amount // 100:,}" if loan_amount else "the requested amount"
+    loan_type = lead.get("loan_type", "Business Loan")
 
     payload = {
         "agent_id": settings.ELEVENLABS_AGENT_ID,
@@ -96,6 +97,7 @@ async def trigger_outbound_call(lead_id: str, tenant_id: str) -> Optional[str]:
         "dynamic_variables": {
             "borrower_name": borrower_name,
             "company_name": company_name,
+            "loan_type": loan_type,
             "loan_amount": loan_amount_str,
             "lead_id": lead_id,
             "tenant_id": tenant_id,
