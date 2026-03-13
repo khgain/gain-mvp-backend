@@ -94,19 +94,26 @@ async def trigger_outbound_call(lead_id: str, tenant_id: str) -> Optional[str]:
         "agent_id": settings.ELEVENLABS_AGENT_ID,
         "agent_phone_number_id": settings.ELEVENLABS_PHONE_NUMBER_ID,
         "to_number": to_number,
-        "dynamic_variables": {
-            "borrower_name": borrower_name,
-            "company_name": company_name,
-            "loan_type": loan_type,
-            "loan_amount": loan_amount_str,
-            "lead_id": lead_id,
-            "tenant_id": tenant_id,
+        "conversation_initiation_client_data": {
+            "dynamic_variables": {
+                "borrower_name": borrower_name,
+                "company_name": company_name,
+                "loan_type": loan_type,
+                "loan_amount": loan_amount_str,
+                "lead_id": lead_id,
+                "tenant_id": tenant_id,
+            },
         },
         "metadata": {
             "lead_id": lead_id,
             "tenant_id": tenant_id,
         },
     }
+
+    logger.info(
+        f"[VOICE] Outbound call payload -- to={to_number} "
+        f"borrower={borrower_name} loan_type={loan_type} amount={loan_amount_str}"
+    )
 
     headers = {
         "xi-api-key": settings.ELEVENLABS_API_KEY,
