@@ -400,9 +400,9 @@ Extract the following information and return a JSON object:
 - callSummary: 1-2 sentence summary of the call outcome and borrower intent
 
 Also determine the qualification outcome:
-- QUALIFIED: borrower answered all key questions and gave consent
-- NOT_QUALIFIED: borrower explicitly declined or does not meet stated criteria
-- INCOMPLETE: call was cut short, borrower did not answer key questions, or data is insufficient
+- QUALIFIED: borrower engaged in the conversation and provided at least SOME business information (turnover, vintage, or loan purpose). They do NOT need to answer every question — partial info is fine. Default to QUALIFIED if the borrower was responsive.
+- NOT_QUALIFIED: borrower explicitly refused the loan, said they are not interested, or asked to not be contacted again
+- INCOMPLETE: call failed to connect, was extremely short (under 30 seconds of actual conversation), or borrower did not speak at all
 
 Return ONLY valid JSON in this format:
 {{
@@ -436,6 +436,11 @@ TRANSCRIPT:
         if outcome not in ("QUALIFIED", "NOT_QUALIFIED", "INCOMPLETE"):
             outcome = "INCOMPLETE"
 
+        logger.info(
+            f"[VOICE] Claude extraction result — outcome={outcome} "
+            f"keys={list(result.keys())} turnover={result.get('declaredTurnover')} "
+            f"vintage={result.get('businessVintage')}"
+        )
         return result, outcome
 
     except json.JSONDecodeError as exc:
