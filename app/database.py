@@ -91,6 +91,11 @@ async def _create_indexes() -> None:
     # Lead mobile_hash — SHA256 of normalized mobile for WhatsApp sender matching
     await db.leads.create_index([("tenant_id", 1), ("mobile_hash", 1)], sparse=True)
 
+    # Lead pan_hash — SHA256 of uppercased PAN for deduplication (sparse: leads without PAN are exempt)
+    await db.leads.create_index(
+        [("tenant_id", 1), ("pan_hash", 1)], unique=True, sparse=True
+    )
+
     logger.info("MongoDB indexes created")
 
 

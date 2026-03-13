@@ -14,6 +14,7 @@ GET    /leads/{id}/timeline         — workflow run history for a lead
 GET    /leads/{id}/validation       — Tier 1 + Tier 2 validation results
 """
 from datetime import datetime, timezone
+from hashlib import sha256
 from typing import Optional
 
 from bson import ObjectId
@@ -43,6 +44,13 @@ def _mask_pan(pan: str) -> str:
     if not pan or len(pan) < 10:
         return pan
     return pan[:5] + "****" + pan[-1]
+
+
+def _hash_pan(pan: str) -> str:
+    """Deterministic SHA-256 hash of normalised PAN for deduplication.
+    Stored alongside encrypted PAN; enables unique-index check without decryption.
+    """
+    return sha256(pan.strip().upper().encode()).hexdigest()
 
 
 def _mask_mobile(mobile: str) -> str:
@@ -145,7 +153,22 @@ async def create_lead(
         "updated_at": now,
     }
     if body.pan:
+        pan_hash = _hash_pan(body.pan)
+        existing = await db.leads.find_one(
+            {"tenant_id": current_user.tenant_id, "pan_hash": pan_hash}
+        )
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "duplicate_pan",
+                    "message": f"A lead with PAN {_mask_pan(body.pan)} already exists.",
+                    "existing_lead_id": str(existing["_id"]),
+                },
+            )
         doc["pan"] = encrypt_field(body.pan)
+        doc["pan_hash"] = pan_hash
+
     if body.mobile:
         doc["mobile"] = encrypt_field(body.mobile)
 
@@ -173,8 +196,32 @@ async def bulk_create_leads(
 ):
     db = get_db()
     now = datetime.now(timezone.utc)
+
+    # Pre-compute PAN hashes and check existing in one DB query
+    incoming_pan_hashes = {
+        _hash_pan(lead.pan): lead.pan
+        for lead in body.leads if lead.pan
+    }
+    existing_pan_hashes: set = set()
+    if incoming_pan_hashes:
+        cursor = db.leads.find(
+            {"tenant_id": current_user.tenant_id, "pan_hash": {"$in": list(incoming_pan_hashes.keys())}},
+            {"pan_hash": 1},
+        )
+        existing_pan_hashes = {doc["pan_hash"] async for doc in cursor}
+
     docs = []
+    skipped = []
     for lead in body.leads:
+        pan_hash = _hash_pan(lead.pan) if lead.pan else None
+        if pan_hash and pan_hash in existing_pan_hashes:
+            skipped.append({
+                "name": lead.name,
+                "pan_masked": _mask_pan(lead.pan),
+                "reason": "duplicate_pan",
+            })
+            continue
+
         doc: dict = {
             "tenant_id": current_user.tenant_id,
             "campaign_id": body.campaign_id or lead.campaign_id,
@@ -197,14 +244,25 @@ async def bulk_create_leads(
         }
         if lead.pan:
             doc["pan"] = encrypt_field(lead.pan)
+            doc["pan_hash"] = pan_hash
+            # Track hash so within-batch duplicates are also caught
+            existing_pan_hashes.add(pan_hash)
         if lead.mobile:
             doc["mobile"] = encrypt_field(lead.mobile)
         docs.append(doc)
 
-    result = await db.leads.insert_many(docs)
-    count = len(result.inserted_ids)
-    logger.info(f"Bulk created {count} leads — tenant={current_user.tenant_id}")
-    return _success(data={"created": count}, message=f"{count} leads created")
+    count = 0
+    if docs:
+        result = await db.leads.insert_many(docs)
+        count = len(result.inserted_ids)
+
+    logger.info(
+        f"Bulk created {count} leads, skipped {len(skipped)} duplicates — tenant={current_user.tenant_id}"
+    )
+    return _success(
+        data={"created": count, "skipped": len(skipped), "skipped_details": skipped},
+        message=f"{count} leads created, {len(skipped)} skipped (duplicate PAN)",
+    )
 
 
 @router.get("/{lead_id}")
