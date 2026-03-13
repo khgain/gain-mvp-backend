@@ -92,9 +92,13 @@ async def _create_indexes() -> None:
     await db.leads.create_index([("tenant_id", 1), ("mobile_hash", 1)], sparse=True)
 
     # Lead pan_hash — SHA256 of uppercased PAN for deduplication (sparse: leads without PAN are exempt)
-    await db.leads.create_index(
-        [("tenant_id", 1), ("pan_hash", 1)], unique=True, sparse=True
-    )
+    try:
+        await db.leads.create_index(
+            [("tenant_id", 1), ("pan_hash", 1)], unique=True, sparse=True
+        )
+    except Exception as exc:
+        # Index may already exist with different options; log and continue
+        logger.warning(f"Could not create pan_hash index (may already exist): {exc}")
 
     logger.info("MongoDB indexes created")
 
