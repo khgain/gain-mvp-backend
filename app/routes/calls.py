@@ -80,7 +80,7 @@ async def list_calls(
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    calls = await db.calls.find(
+    calls = await db.call_records.find(
         {"lead_id": lead_id, "tenant_id": current_user.tenant_id}
     ).sort("initiated_at", -1).to_list(100)
 
@@ -114,7 +114,7 @@ async def get_call(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid call ID")
 
-    call = await db.calls.find_one(
+    call = await db.call_records.find_one(
         {
             "_id": call_oid,
             "lead_id": lead_id,

@@ -117,8 +117,8 @@ class TriggerAgentRequest(BaseModel):
 
 
 class OverrideRequest(BaseModel):
-    action: str  # FORCE_UNDERWRITING | DROP | CHANGE_FOLLOW_UP_FREQUENCY
-    reason: str
+    action: str  # FORCE_UNDERWRITING | DROP | CHANGE_FOLLOW_UP_FREQUENCY | advance_to_doc_collection
+    reason: Optional[str] = None
     follow_up_frequency_days: Optional[int] = None
 
 

@@ -349,6 +349,18 @@ async def override_lead(
     elif body.action == "CHANGE_FOLLOW_UP_FREQUENCY":
         if body.follow_up_frequency_days:
             update["follow_up_frequency_days"] = body.follow_up_frequency_days
+    elif body.action == "advance_to_doc_collection":
+        update["status"] = "DOC_COLLECTION"
+        # Best-effort: enqueue WhatsApp doc checklist
+        try:
+            from app.workers.whatsapp_worker import send_doc_checklist_whatsapp
+            send_doc_checklist_whatsapp.apply_async(
+                kwargs={"lead_id": lead_id, "tenant_id": current_user.tenant_id},
+                queue="whatsapp",
+            )
+            logger.info(f"Doc checklist enqueued for lead_id={lead_id} via manual advance")
+        except Exception as exc:
+            logger.warning(f"WhatsApp checklist enqueue failed on manual advance for lead_id={lead_id}: {exc}")
     else:
         raise HTTPException(status_code=400, detail=f"Unknown action: {body.action}")
 
