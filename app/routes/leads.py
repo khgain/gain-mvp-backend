@@ -461,9 +461,7 @@ async def trigger_follow_up(
 
 
 @router.get("/debug/connectivity")
-async def debug_connectivity(
-    current_user: CurrentUser = Depends(get_current_user),
-):
+async def debug_connectivity():
     """Diagnostic endpoint — test WAHA and SendGrid connectivity."""
     from app.config import settings
     import httpx
