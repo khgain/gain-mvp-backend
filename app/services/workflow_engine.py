@@ -72,7 +72,7 @@ async def _trigger_qualification_call(lead: dict, db) -> None:
 
 
 async def _trigger_doc_collection(lead: dict, db) -> None:
-    """Trigger WhatsApp + Email doc checklist simultaneously."""
+    """Trigger WhatsApp + Email doc checklist directly (no Celery indirection)."""
     lead_id = str(lead["_id"])
     tenant_id = lead["tenant_id"]
     now = datetime.now(timezone.utc)
@@ -83,25 +83,25 @@ async def _trigger_doc_collection(lead: dict, db) -> None:
         {"$set": {"status": "DOC_COLLECTION", "updated_at": now}},
     )
 
-    # Enqueue WhatsApp checklist
+    # --- Send WhatsApp checklist directly (bypass Celery eager mode issues) ---
+    wa_sent = False
     try:
-        from app.workers.whatsapp_worker import send_doc_checklist_whatsapp
-        send_doc_checklist_whatsapp.apply_async(
-            kwargs={"lead_id": lead_id, "tenant_id": tenant_id},
-            queue="whatsapp",
-        )
+        from app.workers.whatsapp_worker import _send_checklist_async
+        result = await _send_checklist_async(lead_id, tenant_id)
+        wa_sent = result.get("status") == "sent"
+        logger.info(f"WhatsApp checklist result for lead_id={lead_id}: {result}")
     except Exception as exc:
-        logger.error(f"WhatsApp checklist enqueue failed for lead_id={lead_id}: {exc}")
+        logger.error(f"WhatsApp checklist failed for lead_id={lead_id}: {exc}", exc_info=True)
 
-    # Enqueue email checklist simultaneously
+    # --- Send Email checklist directly ---
+    email_sent = False
     try:
-        from app.workers.whatsapp_worker import send_doc_checklist_email
-        send_doc_checklist_email.apply_async(
-            kwargs={"lead_id": lead_id, "tenant_id": tenant_id},
-            queue="email",
-        )
+        from app.workers.whatsapp_worker import _send_email_checklist_async
+        result = await _send_email_checklist_async(lead_id, tenant_id)
+        email_sent = result.get("status") == "sent"
+        logger.info(f"Email checklist result for lead_id={lead_id}: {result}")
     except Exception as exc:
-        logger.error(f"Email checklist enqueue failed for lead_id={lead_id}: {exc}")
+        logger.error(f"Email checklist failed for lead_id={lead_id}: {exc}", exc_info=True)
 
     # Create workflow run record
     await db.workflow_runs.insert_one(
@@ -113,14 +113,14 @@ async def _trigger_doc_collection(lead: dict, db) -> None:
             "node_type": "DOC_COLLECTION",
             "status": "RUNNING",
             "input_data": {"entity_type": lead.get("entity_type"), "loan_type": lead.get("loan_type")},
-            "output_data": {},
+            "output_data": {"whatsapp_sent": wa_sent, "email_sent": email_sent},
             "triggered_by": "SYSTEM",
             "executed_at": now,
             "duration_ms": 0,
         }
     )
 
-    logger.info(f"Doc collection triggered for lead_id={lead_id}")
+    logger.info(f"Doc collection triggered for lead_id={lead_id} — WA={wa_sent} Email={email_sent}")
 
 
 async def _notify_underwriting(lead: dict, db) -> None:
