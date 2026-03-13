@@ -43,21 +43,26 @@ async def _process_lead_unsafe(lead_id: str, tenant_id: str) -> None:
         raise ValueError(f"Lead {lead_id} not found")
 
     status = lead.get("status", "NEW")
-    logger.info(f"Processing lead_id={lead_id} current_status={status}")
+    logger.info(f"[WF_ENGINE] Processing lead_id={lead_id} current_status={status!r} tenant_id={tenant_id}")
 
     # State machine: map lead status → next action
     if status == "PAN_VERIFIED":
+        logger.info(f"[WF_ENGINE] → PAN_VERIFIED branch — triggering qualification call")
         await _trigger_qualification_call(lead, db)
 
     elif status == "QUALIFIED":
+        logger.info(f"[WF_ENGINE] → QUALIFIED branch — triggering doc collection for lead_id={lead_id}")
         await _trigger_doc_collection(lead, db)
+        logger.info(f"[WF_ENGINE] → Doc collection trigger completed for lead_id={lead_id}")
 
     elif status == "READY_FOR_UNDERWRITING":
+        logger.info(f"[WF_ENGINE] → READY_FOR_UNDERWRITING branch")
         await _notify_underwriting(lead, db)
 
     else:
-        logger.info(
-            f"No automatic action for lead_id={lead_id} status={status}"
+        logger.warning(
+            f"[WF_ENGINE] No automatic action for lead_id={lead_id} status={status!r} — "
+            f"expected one of: PAN_VERIFIED, QUALIFIED, READY_FOR_UNDERWRITING"
         )
 
 
@@ -76,6 +81,7 @@ async def _trigger_doc_collection(lead: dict, db) -> None:
     lead_id = str(lead["_id"])
     tenant_id = lead["tenant_id"]
     now = datetime.now(timezone.utc)
+    logger.info(f"[WF_ENGINE] _trigger_doc_collection ENTERED — lead_id={lead_id} mobile_present={bool(lead.get('mobile'))} email_present={bool(lead.get('email'))}")
 
     # Update lead status
     await db.leads.update_one(

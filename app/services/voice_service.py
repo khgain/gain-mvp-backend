@@ -302,12 +302,20 @@ async def process_call_completed(payload: dict) -> None:
     if elevenlabs_status in ("no_answer", "failed", "busy", "error"):
         qualification_outcome = "INCOMPLETE"
 
+    logger.info(
+        f"[VOICE] Decision inputs — elevenlabs_status={elevenlabs_status!r} "
+        f"qualification_outcome={qualification_outcome!r} "
+        f"COMPLETED_STATUSES={COMPLETED_STATUSES}"
+    )
+
     if elevenlabs_status in COMPLETED_STATUSES and qualification_outcome == "QUALIFIED":
         new_lead_status = "QUALIFIED"
     elif qualification_outcome in ("NOT_QUALIFIED", "REJECTED"):
         new_lead_status = "NOT_QUALIFIED"
     else:
         new_lead_status = "INCOMPLETE"
+
+    logger.info(f"[VOICE] Resolved new_lead_status={new_lead_status!r}")
 
     ai_summary = extracted_data.get("callSummary") or extracted_data.get("call_summary") or ""
 
@@ -378,13 +386,19 @@ async def process_call_completed(payload: dict) -> None:
     )
 
     # Trigger next workflow step (doc collection if QUALIFIED)
-    if new_lead_status in ("QUALIFIED", "NOT_QUALIFIED"):
-        logger.info(f"[VOICE] Call processed — invoking workflow engine for lead_id={lead_id} status={new_lead_status}")
+    logger.info(f"[VOICE] About to check workflow trigger — new_lead_status={new_lead_status!r} lead_id={lead_id}")
+    if new_lead_status == "QUALIFIED":
+        logger.info(f"[VOICE] Lead QUALIFIED — triggering doc collection directly for lead_id={lead_id}")
         try:
             from app.services.workflow_engine import process_lead
             await process_lead(lead_id, tenant_id)
+            logger.info(f"[VOICE] Workflow engine completed successfully for lead_id={lead_id}")
         except Exception as exc:
-            logger.error(f"[VOICE] Workflow engine failed for lead_id={lead_id}: {exc}")
+            logger.error(f"[VOICE] Workflow engine failed for lead_id={lead_id}: {exc}", exc_info=True)
+    elif new_lead_status == "NOT_QUALIFIED":
+        logger.info(f"[VOICE] Lead NOT_QUALIFIED — no doc collection needed for lead_id={lead_id}")
+    else:
+        logger.info(f"[VOICE] Lead status is {new_lead_status!r} — skipping workflow trigger for lead_id={lead_id}")
 
 
 async def process_call_status_update(payload: dict) -> None:

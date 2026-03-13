@@ -1,0 +1,319 @@
+================================================================================
+BACKEND SERVICES AUDIT - EXECUTIVE SUMMARY
+================================================================================
+
+Generated: 2026-03-14
+Scope: /app/services/ + routes + workers
+Purpose: Complete service map for workflow engine integration
+
+================================================================================
+11 CORE SERVICES IDENTIFIED
+================================================================================
+
+1. AI_SERVICE (app/services/ai_service.py) - FULLY IMPLEMENTED
+   - classify_physical_file() [Claude Haiku] → doc_type, confidence, ambiguity
+   - extract_data() [Claude Haiku] → {field: value} structured extraction
+   - run_tier1_rules() [Claude Haiku per rule] → per-document validation
+   - run_tier2_rules() [Claude Sonnet] → cross-document consistency
+   Triggered by: AI worker tasks (Celery)
+   Calls next: Classification → Extraction → Tier1 → Tier2 chain
+
+2. WORKFLOW_ENGINE (app/services/workflow_engine.py) - FULLY IMPLEMENTED
+   - process_lead() → main state machine orchestrator
+   - advance_to_underwriting() → terminal state after Tier 2 pass
+   Entry points: Lead creation, webhook completion, manual trigger
+   Routing: PAN_VERIFIED→Voice, QUALIFIED→DocCollection, READY_FOR_UNDERWRITING→Notify
+
+3. VALIDATION_RULES (app/services/validation_rules.py) - FULLY IMPLEMENTED
+   - get_*_agent_config() → fetch configurations from MongoDB
+   - check_all_required_docs_passed() → guard for Tier 2 eligibility
+   - build_tier2_lead_summary() → assemble cross-document data
+   - notify_tier1_failure() → send failure notifications
+   Used by: AI workers reading agent configs + validation rules
+
+4. VOICE_SERVICE (app/services/voice_service.py) - FULLY IMPLEMENTED
+   - enqueue_qualification_call() → FastAPI entry point
+   - trigger_outbound_call() → ElevenLabs API integration
+   - process_call_completed() → webhook handler for call results
+   - _extract_from_transcript() [Claude Haiku] → extract loan data from call
+   Entry point: Manual trigger + workflow engine
+   Webhook: ElevenLabs post-call + status updates
+
+5. WHATSAPP_SERVICE (app/services/whatsapp_service.py) - FULLY IMPLEMENTED
+   - send_document_checklist() → initial doc request
+   - send_reminder() → day 1/3/5/7 reminders
+   - send_text_message() → generic messaging
+   - find_lead_by_whatsapp_number() → inbound matching via mobile_hash
+   - compute_mobile_hash() → index for lead lookup
+   Entry point: Celery workers
+   Webhook: WAHA incoming messages + documents
+
+6. EMAIL_SERVICE (app/services/email_service.py) - FULLY IMPLEMENTED
+   - send_document_checklist_email() → initial doc request
+   - send_reminder_email() → day-based reminders
+   - send_doc_status_update_email() → post-Tier1 status feedback
+   Entry point: Celery workers
+   Called by: AI workers after validation events
+
+7. FOLLOW_UP_SERVICE (app/services/follow_up_service.py) - FULLY IMPLEMENTED
+   - check_and_send_reminders() → hourly scheduler entry point
+   Logic: Sends reminders on days 1,3,5,7; escalates to RM after day 7
+   State tracking: whatsapp_messages + activity_feed collections
+
+8. STORAGE_SERVICE (app/services/storage_service.py) - FULLY IMPLEMENTED
+   - upload_file() → S3 upload with AES256 encryption
+   - generate_view_url() → 1-hour presigned GET URL
+   - get_upload_presigned_url() → 1-hour presigned PUT URL (browser upload)
+   - stream_zip_from_s3_files() → ZIP assembly (sync; async variant TBD)
+   Used by: Document routes + workers
+
+9. ZIP_SERVICE (app/services/zip_service.py) - FULLY IMPLEMENTED
+   - extract_and_upload_zip() → decompose ZIP → re-upload files
+   Allowed formats: PDF, JPG, PNG (max 50MB per file)
+   Entry point: Celery worker (extract_zip task)
+   Output: Creates child PhysicalFile records for each extracted file
+
+10. GMAIL_SERVICE (app/services/gmail_service.py) - FULLY IMPLEMENTED
+    - setup_watch() → register Pub/Sub push notifications at startup
+    - process_new_messages() → webhook handler → save attachments
+    Gets attachments → uploads to S3 → enqueues process_whatsapp_document
+    Entry point: Google Cloud Pub/Sub webhook
+
+11. PAN_SERVICE (app/services/pan_service.py) - STUB (MVP PLACEHOLDER)
+    - mark_pan_verified() → manual ops action (no external API call)
+    Status: Placeholder only; real PAN API integration TBD post-MVP
+    Triggers: workflow_engine → voice call qualification
+
+================================================================================
+5 CELERY WORKER FILES
+================================================================================
+
+1. ai_worker.py (8 tasks across 4 queues)
+   - classify_document [ai-classification] → LogicalDoc creation
+   - extract_document_data [ai-extraction] → Tier 1 queueing
+   - run_tier1_validation [ai-tier1] → Tier 2 gating + email notify
+   - run_tier2_validation [ai-tier2] → Final status + underwriting trigger
+   - extract_zip [zip] → Child file classification
+
+2. voice_worker.py (1 task)
+   - place_voice_call [voice] → ElevenLabs API call with 3x retry
+
+3. whatsapp_worker.py (3 tasks)
+   - send_doc_checklist_whatsapp [whatsapp] → Initial checklist
+   - send_doc_checklist_email [email] → Email checklist
+   - process_whatsapp_document [whatsapp] → Inbound document processing
+
+================================================================================
+WEBHOOK ENTRY POINTS (Routes)
+================================================================================
+
+ElevenLabs:
+  POST /webhooks/elevenlabs/call-completed → process_call_completed
+  POST /webhooks/elevenlabs/call-status → process_call_status_update
+
+WAHA (WhatsApp):
+  POST /webhooks/whatsapp/incoming → find lead by mobile → enqueue tasks
+
+Gmail (Pub/Sub):
+  POST /webhooks/gmail-push → process_new_messages → attachments
+
+Document Upload (Portal):
+  POST /leads/{id}/upload → get presigned URL
+  POST /leads/{id}/physical-files/confirm → register + classify/extract_zip
+
+Manual Actions (FastAPI):
+  POST /leads/{id}/verify-pan → pan_service.mark_pan_verified
+  POST /leads/{id}/trigger-agent → voice_service.enqueue_qualification_call
+
+================================================================================
+COMPLETE DATA FLOW
+================================================================================
+
+Lead → [ops: verify PAN] → [voice call via ElevenLabs]
+  ├─ If QUALIFIED: [WhatsApp + Email checklist]
+  └─ If NOT_QUALIFIED/INCOMPLETE: [End or retry]
+
+Borrower sends documents via:
+  ├─ WhatsApp (WAHA webhook → process_whatsapp_document)
+  ├─ Email (Gmail push → attachments → process_whatsapp_document)
+  └─ Portal (presigned S3 PUT → confirm endpoint → classify/extract_zip)
+
+Document Processing (Celery):
+  1. classify_document [ai-classification queue]
+     ├─ If NEEDS_HUMAN_REVIEW (low confidence/ambiguous): End
+     └─ Else: Create LogicalDoc + enqueue extraction
+
+  2. extract_document_data [ai-extraction queue]
+     └─ Call Claude Haiku → get fields → enqueue Tier1
+
+  3. run_tier1_validation [ai-tier1 queue]
+     ├─ If FAILED: Notify borrower + send status email
+     ├─ If PASSED: Send status email
+     └─ If all required docs passed: Enqueue Tier2
+
+  4. run_tier2_validation [ai-tier2 queue]
+     ├─ If PASSED: advance_to_underwriting → READY_FOR_UNDERWRITING
+     └─ If FAILED: Mark VALIDATION_FAILED (or stay in status if FLAG_FOR_OPS)
+
+Automated Follow-ups (Celery Beat hourly):
+  - follow_up_service.check_and_send_reminders()
+    └─ Days 1,3,5,7: WhatsApp + Email reminders
+    └─ Day 7+: Escalate to RM via activity_feed
+
+================================================================================
+CELERY QUEUE CONFIGURATION
+================================================================================
+
+Broker: AWS SQS (or memory/eager in dev mode via CELERY_TASK_ALWAYS_EAGER)
+Result backend: None (fire-and-forget; results in MongoDB)
+Serialization: JSON
+Timezone: Asia/Kolkata
+Task acknowledgment: Late (after completion)
+Worker prefetch: 1 message per worker at a time
+
+Queues:
+  ai-classification   → Classify physical files
+  ai-extraction       → Extract document data
+  ai-tier1            → Tier 1 validation (per-document)
+  ai-tier2            → Tier 2 validation (cross-document)
+  zip                 → ZIP file extraction
+  voice               → Outbound calls via ElevenLabs
+  whatsapp            → WhatsApp messages + doc processing
+  email               → Email messages
+
+================================================================================
+MONGODB COLLECTIONS USED
+================================================================================
+
+Collections queried/updated by services:
+
+leads
+  - Used by: All services for lead data
+  - Key fields: status, entity_type, mobile (encrypted), email, etc.
+
+phys_files (PhysicalFile)
+  - Used by: ai_worker, storage_service, zip_service
+  - Statuses: RECEIVED → CLASSIFYING → CLASSIFIED → NEEDS_HUMAN_REVIEW
+  - Or: → (create LogicalDoc) → classification data stored
+
+logical_docs (LogicalDoc)
+  - Used by: ai_worker, validation_rules
+  - Statuses: READY_FOR_EXTRACTION → EXTRACTING → EXTRACTED →
+              TIER1_VALIDATING → TIER1_PASSED/FAILED →
+              (if all pass T1) → TIER2_VALIDATING
+
+call_records
+  - Used by: voice_service for call state + transcript storage
+
+whatsapp_messages
+  - Used by: whatsapp_service, follow_up_service for message tracking
+
+activity_feed
+  - Used by: All services for audit trail + follow_up_service for escalations
+
+agents (Agent configurations)
+  - Stores: EXTRACTION_AI, VALIDATION_AI, DOC_COLLECTION, VOICE_AI configs
+  - Queried by: validation_rules service + ai_worker
+
+================================================================================
+CONFIGURATION REQUIREMENTS
+================================================================================
+
+MongoDB agents collection must have these agent types:
+
+1. EXTRACTION_AI
+   - classification_confidence_threshold (int, default 75)
+   - extraction_fields_by_doc_type: {doc_type: [field_names]}
+   - classification_prompt_additions (str)
+   - extraction_prompt_additions (str)
+
+2. VALIDATION_AI
+   - tier1_rules: [{rule_id, rule_name, doc_type, enabled, custom_prompt, threshold}]
+   - tier2_rules: [{rule_id, rule_name, custom_prompt}]
+   - on_tier1_failure_action: NOTIFY_BORROWER_AND_CONTINUE | BLOCK_LEAD
+   - on_tier2_failure_action: FLAG_FOR_OPS_REVIEW | BLOCK_LEAD
+   - tier1_failure_message_templates: {rule_id: message_template}
+
+3. DOC_COLLECTION
+   - doc_checklist_by_entity_type: {entity_type: {required: [...], optional: [...]}}
+   - whatsapp_checklist_template (str with {{borrower_name}} etc.)
+   - reminder_whatsapp_template (str)
+
+4. VOICE_AI
+   - (Managed by ElevenLabs; just store ELEVENLABS_AGENT_ID in env)
+
+================================================================================
+ENVIRONMENT VARIABLES REQUIRED
+================================================================================
+
+AI & NLP:
+  ANTHROPIC_API_KEY=sk-...
+
+Voice (ElevenLabs):
+  ELEVENLABS_API_KEY=...
+  ELEVENLABS_AGENT_ID=...
+  ELEVENLABS_PHONE_NUMBER_ID=...
+  ELEVENLABS_WEBHOOK_SECRET=...
+
+WhatsApp (WAHA):
+  WAHA_BASE_URL=http://...
+  WAHA_API_KEY=...
+
+Email (SendGrid):
+  SENDGRID_API_KEY=SG....
+
+Email Inbound (Gmail):
+  GMAIL_SERVICE_ACCOUNT_JSON={...json key...}
+  GMAIL_PUBSUB_TOPIC=projects/PROJECT/topics/TOPIC
+
+File Storage (AWS S3):
+  AWS_REGION=ap-south-1
+  AWS_ACCESS_KEY_ID=...
+  AWS_SECRET_ACCESS_KEY=...
+  S3_BUCKET_NAME=...
+
+Celery & Message Queue (AWS SQS):
+  CELERY_TASK_ALWAYS_EAGER=false (true for dev/testing)
+  SQS_VOICE_QUEUE_URL=...
+  SQS_WHATSAPP_QUEUE_URL=...
+  SQS_EMAIL_QUEUE_URL=...
+  SQS_ZIP_QUEUE_URL=...
+  SQS_AI_CLASSIFICATION_QUEUE_URL=...
+  SQS_AI_EXTRACTION_QUEUE_URL=...
+  SQS_AI_TIER1_QUEUE_URL=...
+  SQS_AI_TIER2_QUEUE_URL=...
+
+================================================================================
+STATUS: INTEGRATION CHECKLIST
+================================================================================
+
+COMPLETED (Fully Wired):
+  [x] Classify → Extract pipeline
+  [x] Extract → Tier 1 validation pipeline
+  [x] Tier 1 → Tier 2 gating (check all required docs passed)
+  [x] Tier 2 → Underwriting advancement
+  [x] Voice qualification → Doc collection trigger
+  [x] PAN verification → Voice qualification
+  [x] Document upload (portal, WhatsApp, email) → Classification
+  [x] Email & WhatsApp notification after validation events
+  [x] Follow-up reminders (days 1,3,5,7 + RM escalation at day 7)
+
+PARTIAL / TODO:
+  [ ] Celery Beat scheduler configuration (follow_up_service hourly run)
+  [ ] Gmail watch renewal scheduler (every 6 days)
+  [ ] Human review UI wiring (NEEDS_HUMAN_REVIEW pathway)
+  [ ] Voice retry fallback (to WhatsApp after max retries)
+  [ ] RM notification implementation (_notify_underwriting currently just logs)
+  [ ] ZIP streaming variant (async/generator-based for large files)
+
+================================================================================
+DOCUMENT LOCATIONS
+================================================================================
+
+Complete audit:
+  /sessions/clever-intelligent-gauss/mnt/gain-backend/SERVICES_AUDIT.md
+
+Quick reference with diagrams:
+  /sessions/clever-intelligent-gauss/mnt/gain-backend/WORKFLOW_QUICK_REFERENCE.md
+
+================================================================================
