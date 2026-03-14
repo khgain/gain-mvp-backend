@@ -103,30 +103,35 @@ async def _get_sent_reminder_days(db, lead_id: str, tenant_id: str) -> set:
 async def _send_reminder_for_day(
     db, lead: dict, lead_id: str, tenant_id: str, day: int, now: datetime
 ) -> None:
-    """Send a WhatsApp and/or email reminder on the given day."""
+    """Send a WhatsApp and/or email reminder on the given day.
+    Uses doc_tracker for smart per-doc status in the message.
+    """
     from app.utils.encryption import decrypt_field
+    from app.services.doc_tracker import get_missing_docs_summary
 
     borrower_name = lead.get("name", "there")
     company_name = lead.get("company_name", "")
     mobile_raw = decrypt_field(lead.get("mobile", ""))
     email = lead.get("email", "")
 
-    # Count missing docs
-    missing_count = await _count_missing_docs(db, lead_id, tenant_id, lead.get("entity_type"))
+    # Get smart doc status from doc_tracker
+    doc_summary = await get_missing_docs_summary(db, lead_id, tenant_id)
 
-    # Get reminder template from DOC_COLLECTION agent config
-    from app.services.validation_rules import get_doc_collection_config
-    config = await get_doc_collection_config(db, tenant_id)
-    reminder_template = config.get(
-        "reminder_whatsapp_template",
-        "Hi {{borrower_name}}, reminder: {{pending_docs}} documents are still pending.",
-    )
-    pending_docs_str = f"{missing_count} document(s)"
+    # If all docs are done, skip the reminder
+    if doc_summary.get("all_done"):
+        logger.info(f"All docs complete for lead_id={lead_id}, skipping day {day} reminder")
+        return
+
+    labels = {1: "Gentle Reminder", 3: "Reminder", 5: "Important Reminder", 7: "Final Reminder"}
+    label = labels.get(day, "Reminder")
+
+    # Build smart WhatsApp message using doc_tracker's per-doc breakdown
     message = (
-        reminder_template
-        .replace("{{borrower_name}}", borrower_name)
-        .replace("{{pending_docs}}", pending_docs_str)
-        .replace("{{company_name}}", company_name)
+        f"📋 *{label}: Documents Update*\n\n"
+        f"Hi {borrower_name}, here's the current status of your loan application"
+        f"{' for ' + company_name if company_name else ''}:\n\n"
+        f"{doc_summary.get('message', 'Please submit your pending documents.')}\n\n"
+        f"Please reply with any pending documents to continue your application."
     )
 
     # Send WhatsApp
@@ -148,21 +153,70 @@ async def _send_reminder_for_day(
         except Exception as exc:
             logger.error(f"WhatsApp reminder (day {day}) failed for lead_id={lead_id}: {exc}")
 
-    # Send email
+    # Send email with smart doc status
     if email:
         try:
-            from app.services.email_service import send_reminder_email
-            await send_reminder_email(
+            pending = doc_summary.get("pending_docs", [])
+            received = doc_summary.get("received_docs", [])
+            failed = doc_summary.get("failed_docs", [])
+
+            # Build HTML email body with per-doc status
+            html_sections = [f"<p>Dear {borrower_name},</p>"]
+            html_sections.append(
+                f"<p>This is a <strong>{label.lower()}</strong> regarding your loan application"
+                f"{' for ' + company_name if company_name else ''}.</p>"
+            )
+
+            if received:
+                html_sections.append("<p><strong>✅ Received & Verified:</strong></p><ul>")
+                for doc in received:
+                    html_sections.append(f"<li>{doc}</li>")
+                html_sections.append("</ul>")
+
+            if failed:
+                html_sections.append("<p><strong>❌ Needs Resubmission:</strong></p><ul>")
+                for doc in failed:
+                    html_sections.append(f"<li>{doc}</li>")
+                html_sections.append("</ul>")
+
+            if pending:
+                html_sections.append("<p><strong>📋 Still Needed:</strong></p><ul>")
+                for doc in pending:
+                    html_sections.append(f"<li>{doc}</li>")
+                html_sections.append("</ul>")
+
+            html_sections.append(
+                "<p>Please reply to this email with the pending documents attached.</p>"
+                "<p>Best regards,<br/>Gain AI Lending Team</p>"
+            )
+            body_html = "\n".join(html_sections)
+
+            from app.services.email_service import send_status_update_email
+            await send_status_update_email(
                 lead_id=lead_id,
-                borrower_name=borrower_name,
+                tenant_id=tenant_id,
                 borrower_email=email,
-                company_name=company_name,
-                pending_docs=[f"{missing_count} documents pending"],
-                day=day,
+                subject=f"{label}: Documents Pending — {company_name} Loan Application",
+                body_html=body_html,
             )
             logger.info(f"Day {day} email reminder sent for lead_id={lead_id}")
         except Exception as exc:
             logger.error(f"Email reminder (day {day}) failed for lead_id={lead_id}: {exc}")
+
+    # Log to activity_feed for Activity tab visibility
+    await db.activity_feed.insert_one({
+        "tenant_id": tenant_id,
+        "lead_id": lead_id,
+        "event_type": "FOLLOW_UP_SENT",
+        "message": f"Day {day} follow-up reminder sent. {len(doc_summary.get('pending_docs', []))} docs pending.",
+        "detail": {
+            "day": day,
+            "pending_count": len(doc_summary.get("pending_docs", [])),
+            "received_count": len(doc_summary.get("received_docs", [])),
+            "failed_count": len(doc_summary.get("failed_docs", [])),
+        },
+        "created_at": now,
+    })
 
 
 async def _escalate_to_rm(db, lead: dict, lead_id: str, tenant_id: str, now: datetime) -> None:
@@ -183,23 +237,4 @@ async def _escalate_to_rm(db, lead: dict, lead_id: str, tenant_id: str, now: dat
     logger.info(f"RM escalation logged for lead_id={lead_id}")
 
 
-async def _count_missing_docs(db, lead_id: str, tenant_id: str, entity_type: str) -> int:
-    """Count required doc types that have not yet been submitted."""
-    from app.services.validation_rules import get_doc_collection_config
-
-    config = await get_doc_collection_config(db, tenant_id)
-    entity_checklist = config.get("doc_checklist_by_entity_type", {}).get(entity_type or "INDIVIDUAL", {})
-    required = set(entity_checklist.get("required", []))
-    if not required:
-        return 0
-
-    submitted_types = set()
-    cursor = db.logical_docs.find({
-        "lead_id": lead_id,
-        "tenant_id": tenant_id,
-        "status": {"$in": ["TIER1_PASSED", "HUMAN_REVIEWED", "TIER1_VALIDATING", "EXTRACTING", "EXTRACTED", "READY_FOR_EXTRACTION"]},
-    })
-    async for doc in cursor:
-        submitted_types.add(doc.get("doc_type", ""))
-
-    return len(required - submitted_types)
+    # _count_missing_docs removed — now uses doc_tracker.get_missing_docs_summary()

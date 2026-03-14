@@ -116,7 +116,7 @@ async def get_activity_timeline(
             "message": ev.get("message", ""),
             "created_at": ev["created_at"].isoformat() if hasattr(ev.get("created_at"), "isoformat") else str(ev.get("created_at", "")),
             "created_by": ev.get("created_by"),
-            "metadata": ev.get("metadata"),
+            "metadata": ev.get("metadata") or ev.get("detail"),
         })
 
     # Compute next planned action based on lead status and doc state

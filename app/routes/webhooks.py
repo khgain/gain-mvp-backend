@@ -862,3 +862,21 @@ async def gmail_push_notification(request: Request):
         logger.error(f"Gmail push handler error: {exc}")
         # Still return 200 to prevent Pub/Sub from retrying indefinitely
         return _ok("Error handled")
+
+
+# ---------------------------------------------------------------------------
+# Follow-up trigger — direct async (bypasses Celery Beat)
+# ---------------------------------------------------------------------------
+
+@router.post("/follow-up/trigger")
+async def trigger_follow_up_check():
+    """
+    Manually or cron-trigger the follow-up check.
+    Runs doc-tracker-aware reminders for all leads in DOC_COLLECTION.
+    Can be called by Railway cron, external scheduler, or manual API call.
+    """
+    import asyncio
+    from app.workers.follow_up_worker import run_follow_up_check_async
+
+    asyncio.create_task(run_follow_up_check_async())
+    return _ok("Follow-up check started")
