@@ -94,6 +94,9 @@ async def send_document_checklist_email(
                 )
                 return False
         logger.info(f"Email checklist sent — lead_id={lead_id} to={borrower_email}")
+
+        # Persist outbound email for Email tab
+        await _persist_outbound_email(lead_id, tenant_id, borrower_email, subject, plain_body[:500])
         return True
     except Exception as exc:
         logger.error(f"Email send failed for lead_id={lead_id}: {exc}")
@@ -306,6 +309,9 @@ async def send_doc_status_update_email(
             "message": subject,
             "created_at": datetime.now(timezone.utc),
         })
+
+        # Persist outbound email for Email tab
+        await _persist_outbound_email(lead_id, tenant_id, borrower_email, subject, plain[:500])
         return True
 
     except Exception as exc:
@@ -345,6 +351,8 @@ async def send_status_update_email(
             )
             if resp.status_code in (200, 201, 202):
                 logger.info(f"Status update email sent to {borrower_email} for lead_id={lead_id}")
+                # Persist outbound email for Email tab
+                await _persist_outbound_email(lead_id, tenant_id, borrower_email, subject, body_html[:500])
                 return True
             else:
                 logger.error(f"SendGrid error {resp.status_code}: {resp.text[:200]}")
@@ -352,6 +360,28 @@ async def send_status_update_email(
     except Exception as exc:
         logger.error(f"Status update email failed for lead_id={lead_id}: {exc}")
         return False
+
+
+async def _persist_outbound_email(
+    lead_id: str, tenant_id: str, to_email: str, subject: str, body_preview: str,
+) -> None:
+    """Persist outbound email to email_messages collection for Email tab display."""
+    try:
+        from app.database import get_db
+        db = get_db()
+        await db.email_messages.insert_one({
+            "lead_id": lead_id,
+            "tenant_id": tenant_id,
+            "direction": "OUTBOUND",
+            "from_email": _FROM_EMAIL,
+            "to_email": to_email,
+            "subject": subject,
+            "body_text": body_preview,
+            "attachments": [],
+            "received_at": datetime.now(timezone.utc),
+        })
+    except Exception as exc:
+        logger.warning(f"Failed to persist outbound email for lead_id={lead_id}: {exc}")
 
 
 async def log_outbound_email(

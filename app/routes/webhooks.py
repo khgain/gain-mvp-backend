@@ -115,6 +115,21 @@ async def elevenlabs_call_completed(
     )
     logger.info(f"ElevenLabs call-completed webhook — conversation_id={conversation_id}")
 
+    # --- Idempotency guard: skip if this conversation_id was already processed ---
+    if conversation_id:
+        from app.database import get_db
+        db = get_db()
+        existing = await db.webhook_idempotency.find_one({"conversation_id": conversation_id})
+        if existing:
+            logger.warning(f"[WEBHOOK] Duplicate call-completed for conversation_id={conversation_id} — skipping")
+            return _ok("Already processed (duplicate)")
+        # Mark as processing BEFORE executing to prevent race conditions
+        from datetime import datetime, timezone
+        await db.webhook_idempotency.insert_one({
+            "conversation_id": conversation_id,
+            "processed_at": datetime.now(timezone.utc),
+        })
+
     try:
         from app.services.voice_service import process_call_completed
         await process_call_completed(payload)
@@ -264,13 +279,7 @@ async def whatsapp_incoming(request: Request):
             mobile_raw = decrypt_field(lead.get("mobile", ""))
             if mobile_raw:
                 ack_msg = f"✅ Document received! We're reviewing it now. You'll get an update once processing is complete."
-                await send_text_message(lead_id, mobile_raw, ack_msg)
-                await db.whatsapp_messages.insert_one({
-                    "lead_id": lead_id, "tenant_id": tenant_id,
-                    "direction": "OUTBOUND", "message_type": "TEXT",
-                    "content": ack_msg, "status": "SENT",
-                    "template_name": "DOC_RECEIVED_ACK", "sent_at": now,
-                })
+                await send_text_message(lead_id, mobile_raw, ack_msg, tenant_id=tenant_id)
                 logger.info(f"Sent document receipt acknowledgment to lead_id={lead_id}")
         except Exception as exc:
             logger.warning(f"Failed to send document ack for lead_id={lead_id}: {exc}")
@@ -607,6 +616,8 @@ async def _send_doc_status_reply(
 ) -> None:
     """Send a smart reply via WhatsApp and Email with doc status + missing docs list."""
     from app.services.doc_tracker import get_missing_docs_summary
+    from bson import ObjectId
+    from datetime import datetime, timezone
 
     try:
         summary = await get_missing_docs_summary(db, lead_id, tenant_id)
@@ -633,23 +644,18 @@ async def _send_doc_status_reply(
         now = datetime.now(timezone.utc)
 
         # Send via WhatsApp
+        # Send via WhatsApp (service now auto-persists to whatsapp_messages)
         try:
             from app.utils.encryption import decrypt_field
             from app.services.whatsapp_service import send_text_message
             mobile_raw = decrypt_field(lead.get("mobile", ""))
             if mobile_raw:
-                await send_text_message(lead_id, mobile_raw, full_message)
-                await db.whatsapp_messages.insert_one({
-                    "lead_id": lead_id, "tenant_id": tenant_id,
-                    "direction": "OUTBOUND", "message_type": "TEXT",
-                    "content": full_message, "status": "SENT",
-                    "template_name": "DOC_STATUS_UPDATE", "sent_at": now,
-                })
+                await send_text_message(lead_id, mobile_raw, full_message, tenant_id=tenant_id)
                 logger.info(f"[DOC PIPELINE] Sent doc status update via WhatsApp for lead_id={lead_id}")
         except Exception as exc:
             logger.warning(f"[DOC PIPELINE] WhatsApp status reply failed: {exc}")
 
-        # Send via Email
+        # Send via Email (service now auto-persists to email_messages)
         try:
             borrower_email = lead.get("email", "")
             if borrower_email:
@@ -662,12 +668,6 @@ async def _send_doc_status_reply(
                     subject=subject,
                     body_html=email_body,
                 )
-                await db.email_messages.insert_one({
-                    "lead_id": lead_id, "tenant_id": tenant_id,
-                    "direction": "OUTBOUND", "from_email": "demo.docs@unlockgain.com",
-                    "subject": subject, "body_text": full_message[:500],
-                    "attachments": [], "received_at": now,
-                })
                 logger.info(f"[DOC PIPELINE] Sent doc status update via Email for lead_id={lead_id}")
         except Exception as exc:
             logger.warning(f"[DOC PIPELINE] Email status reply failed: {exc}")

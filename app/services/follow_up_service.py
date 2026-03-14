@@ -138,17 +138,7 @@ async def _send_reminder_for_day(
     if mobile_raw:
         try:
             from app.services.whatsapp_service import send_text_message
-            await send_text_message(lead_id, mobile_raw, message)
-            await db.whatsapp_messages.insert_one({
-                "lead_id": lead_id,
-                "tenant_id": tenant_id,
-                "direction": "OUTBOUND",
-                "message_type": "TEXT",
-                "content": message,
-                "status": "SENT",
-                "template_name": f"REMINDER_DAY_{day}",
-                "sent_at": now,
-            })
+            await send_text_message(lead_id, mobile_raw, message, tenant_id=tenant_id)
             logger.info(f"Day {day} WhatsApp reminder sent for lead_id={lead_id}")
         except Exception as exc:
             logger.error(f"WhatsApp reminder (day {day}) failed for lead_id={lead_id}: {exc}")

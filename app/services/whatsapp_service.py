@@ -105,6 +105,7 @@ async def send_document_checklist(
     name: str,
     entity_type: Optional[str] = None,
     loan_amount_paise: Optional[int] = None,
+    tenant_id: Optional[str] = None,
 ) -> bool:
     """Send the initial document checklist via WhatsApp. Returns True on success."""
     if not settings.WAHA_BASE_URL or not settings.WAHA_API_KEY:
@@ -123,6 +124,11 @@ async def send_document_checklist(
             )
             resp.raise_for_status()
         logger.info(f"WhatsApp checklist sent — lead_id={lead_id} chat_id={chat_id}")
+
+        # Persist outbound message for WhatsApp tab
+        await _persist_outbound_message(
+            lead_id, tenant_id, message, "TEMPLATE", "DOC_CHECKLIST",
+        )
         return True
     except Exception as exc:
         logger.error(f"WhatsApp send failed for lead_id={lead_id}: {exc}")
@@ -184,7 +190,7 @@ async def find_lead_by_whatsapp_number(db, tenant_id: str, sender_chat_id: str) 
     return lead
 
 
-async def send_text_message(lead_id: str, mobile: str, text: str) -> bool:
+async def send_text_message(lead_id: str, mobile: str, text: str, tenant_id: Optional[str] = None) -> bool:
     """Low-level helper — send a plain text WhatsApp message via WAHA."""
     if not settings.WAHA_BASE_URL or not settings.WAHA_API_KEY:
         logger.warning(f"WAHA not configured — skip send_text_message for lead_id={lead_id}")
@@ -198,7 +204,40 @@ async def send_text_message(lead_id: str, mobile: str, text: str) -> bool:
                 headers={"X-Api-Key": settings.WAHA_API_KEY},
             )
             resp.raise_for_status()
+
+        # Persist outbound message for WhatsApp tab
+        await _persist_outbound_message(lead_id, tenant_id, text, "TEXT", None)
         return True
     except Exception as exc:
         logger.error(f"send_text_message failed for lead_id={lead_id}: {exc}")
         return False
+
+
+async def _persist_outbound_message(
+    lead_id: str, tenant_id: Optional[str], content: str,
+    message_type: str = "TEXT", template_name: Optional[str] = None,
+) -> None:
+    """Persist outbound WhatsApp message to whatsapp_messages for UI display."""
+    try:
+        from app.database import get_db
+        db = get_db()
+        now = datetime.now(timezone.utc)
+
+        # If no tenant_id passed, look it up from the lead
+        if not tenant_id:
+            from bson import ObjectId
+            lead = await db.leads.find_one({"_id": ObjectId(lead_id)})
+            tenant_id = lead.get("tenant_id", "") if lead else ""
+
+        await db.whatsapp_messages.insert_one({
+            "lead_id": lead_id,
+            "tenant_id": tenant_id,
+            "direction": "OUTBOUND",
+            "message_type": message_type,
+            "content": content[:2000],  # cap at 2000 chars
+            "status": "SENT",
+            "template_name": template_name,
+            "sent_at": now,
+        })
+    except Exception as exc:
+        logger.warning(f"Failed to persist outbound WhatsApp message: {exc}")

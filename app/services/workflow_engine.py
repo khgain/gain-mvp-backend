@@ -106,6 +106,7 @@ async def _trigger_doc_collection(lead: dict, db) -> None:
                 name=borrower_name,
                 entity_type=entity_type,
                 loan_amount_paise=loan_amount,
+                tenant_id=tenant_id,
             )
             # Store mobile_hash for inbound WA matching
             mobile_hash = compute_mobile_hash(mobile_raw)
