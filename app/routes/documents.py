@@ -357,6 +357,63 @@ async def list_logical_docs(
 
 
 # ---------------------------------------------------------------------------
+# GET /leads/{lead_id}/validation — Tier 1 + Tier 2 results for frontend
+# ---------------------------------------------------------------------------
+
+@router.get("/{lead_id}/validation")
+async def get_lead_validation(
+    lead_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Return Tier 1 and Tier 2 validation results for the Validation tab.
+    Tier 1: per-document results from logical_docs.tier1_validation
+    Tier 2: cross-document results from activity_feed (TIER2_VALIDATION_COMPLETE)
+    """
+    db = get_db()
+    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    # Tier 1: collect from logical_docs that have tier1_validation
+    tier1 = []
+    async for doc in db.logical_docs.find(
+        {"lead_id": lead_id, "tenant_id": current_user.tenant_id, "tier1_validation": {"$ne": None}},
+        sort=[("created_at", 1)],
+    ):
+        t1 = doc.get("tier1_validation", {})
+        for rule_result in t1.get("rule_results", []):
+            tier1.append({
+                "doc_type": doc.get("doc_type", "UNKNOWN"),
+                "document": doc.get("doc_type", "UNKNOWN"),
+                "rule_name": rule_result.get("rule_name", rule_result.get("rule_id", "—")),
+                "check": rule_result.get("rule_name", rule_result.get("rule_id", "—")),
+                "status": rule_result.get("status", "PENDING"),
+                "detail": rule_result.get("detail", rule_result.get("message", "")),
+                "message": rule_result.get("detail", rule_result.get("message", "")),
+            })
+
+    # Tier 2: collect from activity_feed
+    tier2 = []
+    t2_events = await db.activity_feed.find(
+        {"lead_id": lead_id, "tenant_id": current_user.tenant_id, "event_type": "TIER2_VALIDATION_COMPLETE"},
+        sort=[("created_at", -1)],
+    ).to_list(10)
+
+    for event in t2_events:
+        metadata = event.get("metadata", {})
+        for rule_result in metadata.get("rule_results", []):
+            tier2.append({
+                "rule_name": rule_result.get("rule_name", rule_result.get("rule_id", "—")),
+                "check": rule_result.get("rule_name", rule_result.get("rule_id", "—")),
+                "sources": rule_result.get("sources", []),
+                "status": rule_result.get("status", "PENDING"),
+                "detail": rule_result.get("detail", rule_result.get("message", "")),
+                "message": rule_result.get("detail", rule_result.get("message", "")),
+            })
+
+    return _success({"tier1": tier1, "tier2": tier2})
+
+
+# ---------------------------------------------------------------------------
 # GET /leads/{lead_id}/logical-docs/{doc_id}
 # ---------------------------------------------------------------------------
 

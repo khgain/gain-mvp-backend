@@ -257,6 +257,24 @@ async def whatsapp_incoming(request: Request):
     if has_media:
         await _process_incoming_media(db, payload, msg, lead_id, tenant_id, waha_message_id, now)
 
+        # Send acknowledgment to borrower
+        try:
+            from app.services.whatsapp_service import send_text_message
+            from app.utils.encryption import decrypt_field
+            mobile_raw = decrypt_field(lead.get("mobile", ""))
+            if mobile_raw:
+                ack_msg = f"✅ Document received! We're reviewing it now. You'll get an update once processing is complete."
+                await send_text_message(lead_id, mobile_raw, ack_msg)
+                await db.whatsapp_messages.insert_one({
+                    "lead_id": lead_id, "tenant_id": tenant_id,
+                    "direction": "OUTBOUND", "message_type": "TEXT",
+                    "content": ack_msg, "status": "SENT",
+                    "template_name": "DOC_RECEIVED_ACK", "sent_at": now,
+                })
+                logger.info(f"Sent document receipt acknowledgment to lead_id={lead_id}")
+        except Exception as exc:
+            logger.warning(f"Failed to send document ack for lead_id={lead_id}: {exc}")
+
     return _ok("Received")
 
 
@@ -325,20 +343,255 @@ async def _process_incoming_media(
         {"$set": {"media_s3_key": s3_key, "media_filename": original_filename}},
     )
 
-    # Enqueue document processing
-    from app.workers.whatsapp_worker import process_whatsapp_document
-    process_whatsapp_document.apply_async(
-        kwargs={
-            "file_s3_key": s3_key,
-            "lead_id": lead_id,
-            "tenant_id": tenant_id,
-            "original_filename": original_filename,
-            "file_size_bytes": len(file_bytes),
-            "waha_message_id": waha_message_id,
-        },
-        queue="whatsapp",
+    # Process document directly (bypass Celery eager mode issues)
+    import asyncio
+    from app.workers.whatsapp_worker import _process_doc_async
+    asyncio.create_task(
+        _run_doc_processing_pipeline(
+            s3_key, lead_id, tenant_id, original_filename,
+            len(file_bytes), waha_message_id
+        )
     )
-    logger.info(f"Media queued for processing: {original_filename} for lead_id={lead_id}")
+    logger.info(f"Media processing started: {original_filename} for lead_id={lead_id}")
+
+
+# ---------------------------------------------------------------------------
+# Direct document processing pipeline (bypasses Celery eager mode issues)
+# ---------------------------------------------------------------------------
+
+async def _run_doc_processing_pipeline(
+    file_s3_key: str, lead_id: str, tenant_id: str,
+    original_filename: str, file_size_bytes: int, waha_message_id: str,
+    channel: str = "WHATSAPP",
+) -> None:
+    """
+    Run the full document processing pipeline directly (no Celery):
+    PhysicalFile → Classify → Extract → Tier1 → (maybe Tier2)
+    """
+    import asyncio
+    from app.database import get_db
+    from datetime import datetime, timezone
+
+    db = get_db()
+    now = datetime.now(timezone.utc)
+
+    try:
+        # --- Step 1: Create PhysicalFile record ---
+        ext = original_filename.lower().rsplit(".", 1)[-1] if "." in original_filename else "other"
+        file_type_map = {"pdf": "PDF", "jpg": "JPG", "jpeg": "JPG", "png": "PNG", "zip": "ZIP"}
+        file_type = file_type_map.get(ext, "OTHER")
+        is_zip = ext == "zip"
+
+        phys_file_doc = {
+            "lead_id": lead_id, "tenant_id": tenant_id,
+            "original_filename": original_filename, "channel_received": channel,
+            "s3_key": file_s3_key, "file_type": file_type,
+            "file_size_bytes": file_size_bytes,
+            "status": "EXTRACTING_ZIP" if is_zip else "RECEIVED",
+            "waha_message_id": waha_message_id,
+            "logical_doc_ids": [], "created_at": now, "updated_at": now,
+        }
+        result = await db.phys_files.insert_one(phys_file_doc)
+        phys_file_id = str(result.inserted_id)
+        logger.info(f"[DOC PIPELINE] PhysFile created: {phys_file_id} file={original_filename}")
+
+        # Reject tiny files
+        if 0 < file_size_bytes < 10240:
+            await db.phys_files.update_one(
+                {"_id": result.inserted_id},
+                {"$set": {"status": "NEEDS_HUMAN_REVIEW", "classification_reasoning": "File too small (<10KB)", "updated_at": now}},
+            )
+            logger.warning(f"[DOC PIPELINE] File too small ({file_size_bytes}B) — flagged: {original_filename}")
+            return
+
+        await db.activity_feed.insert_one({
+            "tenant_id": tenant_id, "lead_id": lead_id,
+            "event_type": "DOCUMENT_RECEIVED",
+            "message": f"Document received via {channel}: {original_filename}",
+            "created_at": now,
+        })
+
+        if is_zip:
+            logger.info(f"[DOC PIPELINE] ZIP file — skipping classification for now: {original_filename}")
+            return
+
+        # --- Step 2: Classify document ---
+        logger.info(f"[DOC PIPELINE] Classifying phys_file_id={phys_file_id}")
+        await db.phys_files.update_one(
+            {"_id": result.inserted_id},
+            {"$set": {"status": "CLASSIFYING", "updated_at": datetime.now(timezone.utc)}},
+        )
+
+        from app.services.ai_service import classify_physical_file
+        from app.services.validation_rules import get_extraction_agent_config
+
+        extraction_config = await get_extraction_agent_config(db, tenant_id)
+        prompt_additions = extraction_config.get("classification_prompt_additions", "")
+        confidence_threshold = extraction_config.get("classification_confidence_threshold", 75)
+
+        # ai_service functions are synchronous — run in thread pool
+        classify_result = await asyncio.to_thread(
+            classify_physical_file,
+            s3_key=file_s3_key,
+            original_filename=original_filename,
+            extraction_prompt_additions=prompt_additions,
+        )
+
+        doc_type = classify_result.get("doc_type", "OTHER")
+        confidence = classify_result.get("confidence", 0)
+        ambiguity_type = classify_result.get("ambiguity_type", "NORMAL")
+        reasoning = classify_result.get("reasoning", "")
+
+        new_status = "CLASSIFIED"
+        if confidence < confidence_threshold or doc_type == "OTHER":
+            new_status = "NEEDS_HUMAN_REVIEW"
+        elif ambiguity_type == "BUNDLED":
+            new_status = "NEEDS_HUMAN_REVIEW"
+
+        await db.phys_files.update_one(
+            {"_id": result.inserted_id},
+            {"$set": {
+                "status": new_status, "ambiguity_type": ambiguity_type,
+                "classification_confidence": confidence,
+                "classification_reasoning": reasoning,
+                "updated_at": datetime.now(timezone.utc),
+            }},
+        )
+        logger.info(f"[DOC PIPELINE] Classified: {doc_type} confidence={confidence} status={new_status}")
+
+        if new_status == "NEEDS_HUMAN_REVIEW":
+            return
+
+        # --- Step 3: Create LogicalDoc ---
+        from bson import ObjectId
+        completeness = "PARTIAL" if ambiguity_type == "PARTIAL" else "COMPLETE"
+        doc_status = "ASSEMBLING" if ambiguity_type == "PARTIAL" else "READY_FOR_EXTRACTION"
+
+        ldoc_result = await db.logical_docs.insert_one({
+            "lead_id": lead_id, "tenant_id": tenant_id,
+            "doc_type": doc_type, "assembly_type": "SINGLE",
+            "physical_file_ids": [phys_file_id],
+            "completeness_status": completeness, "is_mandatory": True,
+            "extracted_data": {}, "tier1_validation": None,
+            "status": doc_status,
+            "created_at": datetime.now(timezone.utc), "updated_at": datetime.now(timezone.utc),
+        })
+        logical_doc_id = str(ldoc_result.inserted_id)
+        await db.phys_files.update_one(
+            {"_id": result.inserted_id},
+            {"$addToSet": {"logical_doc_ids": logical_doc_id}},
+        )
+        logger.info(f"[DOC PIPELINE] LogicalDoc created: {logical_doc_id} type={doc_type}")
+
+        # --- Step 4: Extract data ---
+        logger.info(f"[DOC PIPELINE] Extracting data from logical_doc_id={logical_doc_id}")
+        await db.logical_docs.update_one(
+            {"_id": ldoc_result.inserted_id},
+            {"$set": {"status": "EXTRACTING", "updated_at": datetime.now(timezone.utc)}},
+        )
+
+        from app.services.ai_service import extract_data
+        fields = extraction_config.get("extraction_fields_by_doc_type", {}).get(doc_type, [])
+        ext_prompt = extraction_config.get("extraction_prompt_additions", "")
+
+        extracted = await asyncio.to_thread(
+            extract_data,
+            s3_key=file_s3_key,
+            original_filename=original_filename,
+            doc_type=doc_type,
+            fields_to_extract=fields,
+            extraction_prompt_additions=ext_prompt,
+        )
+
+        await db.logical_docs.update_one(
+            {"_id": ldoc_result.inserted_id},
+            {"$set": {"extracted_data": extracted, "status": "EXTRACTED", "updated_at": datetime.now(timezone.utc)}},
+        )
+        logger.info(f"[DOC PIPELINE] Extracted {len(extracted)} fields from {doc_type}")
+
+        # --- Step 5: Tier 1 validation ---
+        logger.info(f"[DOC PIPELINE] Running Tier 1 validation for logical_doc_id={logical_doc_id}")
+        await db.logical_docs.update_one(
+            {"_id": ldoc_result.inserted_id},
+            {"$set": {"status": "TIER1_VALIDATING", "updated_at": datetime.now(timezone.utc)}},
+        )
+
+        from app.services.ai_service import run_tier1_rules
+        from app.services.validation_rules import (
+            get_validation_agent_config,
+            check_all_required_docs_passed,
+            notify_tier1_failure,
+        )
+
+        val_config = await get_validation_agent_config(db, tenant_id)
+        tier1_rules = val_config.get("tier1_rules", [])
+        on_failure_action = val_config.get("on_tier1_failure_action", "NOTIFY_BORROWER_AND_CONTINUE")
+        failure_templates = val_config.get("tier1_failure_message_templates", {})
+
+        validation_result = await asyncio.to_thread(
+            run_tier1_rules,
+            doc_type=doc_type,
+            extracted_data=extracted,
+            tier1_rules=tier1_rules,
+            file_size_bytes=file_size_bytes,
+        )
+
+        tier1_passed = validation_result["passed"]
+        t1_status = "TIER1_PASSED" if tier1_passed else "TIER1_FAILED"
+
+        await db.logical_docs.update_one(
+            {"_id": ldoc_result.inserted_id},
+            {"$set": {
+                "tier1_validation": {
+                    "passed": tier1_passed,
+                    "rule_results": validation_result["rule_results"],
+                },
+                "tier1_validated_at": datetime.now(timezone.utc),
+                "status": t1_status,
+                "updated_at": datetime.now(timezone.utc),
+            }},
+        )
+        logger.info(f"[DOC PIPELINE] Tier 1 {t1_status} for {doc_type} logical_doc_id={logical_doc_id}")
+
+        if not tier1_passed:
+            if on_failure_action == "NOTIFY_BORROWER_AND_CONTINUE":
+                await notify_tier1_failure(
+                    db, lead_id, tenant_id, doc_type,
+                    validation_result.get("failed_rule_ids", []), failure_templates
+                )
+            return
+
+        # Check if all required docs passed → trigger Tier 2
+        all_passed = await check_all_required_docs_passed(db, lead_id, tenant_id)
+        if all_passed:
+            logger.info(f"[DOC PIPELINE] All required docs T1 passed — running Tier 2 for lead_id={lead_id}")
+            from app.services.ai_service import run_tier2_rules
+            from app.services.validation_rules import build_tier2_lead_summary
+            from app.services.workflow_engine import advance_to_underwriting
+
+            tier2_rules = val_config.get("tier2_rules", [])
+            t2_prompt = val_config.get("validation_prompt_additions", "")
+            lead_summary = await build_tier2_lead_summary(db, lead_id, tenant_id)
+
+            t2_result = await asyncio.to_thread(
+                run_tier2_rules, lead_summary, tier2_rules, t2_prompt
+            )
+            tier2_passed = t2_result["passed"]
+
+            await db.activity_feed.insert_one({
+                "tenant_id": tenant_id, "lead_id": lead_id,
+                "event_type": "TIER2_VALIDATION_COMPLETE",
+                "message": f"Tier 2 validation {'PASSED' if tier2_passed else 'FAILED'}",
+                "metadata": {"rule_results": t2_result.get("rule_results", [])},
+                "created_at": datetime.now(timezone.utc),
+            })
+
+            if tier2_passed:
+                await advance_to_underwriting(lead_id, tenant_id)
+                logger.info(f"[DOC PIPELINE] Tier 2 PASSED → READY_FOR_UNDERWRITING lead_id={lead_id}")
+
+    except Exception as exc:
+        logger.error(f"[DOC PIPELINE] Failed for lead_id={lead_id} file={original_filename}: {exc}", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -394,23 +647,35 @@ async def email_incoming(request: Request):
     lead_id = str(lead["_id"])
     tenant_id = lead["tenant_id"]
 
+    # Collect attachment filenames for email_messages record
+    attachment_names = []
+
     # Log inbound email in activity feed
     await db.activity_feed.insert_one({
         "tenant_id": tenant_id,
         "lead_id": lead_id,
         "event_type": "EMAIL_RECEIVED",
         "message": f"Email received from {raw_email}: {subject[:80]}",
+        "subject": subject,
+        "from_email": raw_email,
         "created_at": now,
     })
 
     if attachments_count == 0:
-        logger.info(f"Email from {raw_email} has no attachments — ignoring")
+        # Still persist the email message even without attachments
+        body_text = form.get("text", "") or form.get("html", "")
+        await db.email_messages.insert_one({
+            "lead_id": lead_id, "tenant_id": tenant_id,
+            "direction": "INBOUND", "from_email": raw_email,
+            "subject": subject, "body_text": str(body_text)[:500],
+            "attachments": [], "received_at": now,
+        })
+        logger.info(f"Email from {raw_email} has no attachments — saved to email_messages")
         return _ok("No attachments")
 
     # Process attachments
+    import asyncio
     from app.services.storage_service import upload_file, build_s3_key
-    from app.workers.whatsapp_worker import process_whatsapp_document
-    import time
 
     processed = 0
     for i in range(1, attachments_count + 1):
@@ -419,13 +684,11 @@ async def email_incoming(request: Request):
         if not file_field:
             continue
 
-        # SendGrid provides UploadFile-like object
         try:
             if hasattr(file_field, "read"):
                 file_bytes = await file_field.read()
                 filename = getattr(file_field, "filename", None) or f"attachment_{i}.pdf"
             elif isinstance(file_field, str):
-                # SendGrid may send base64 or raw bytes as string
                 file_bytes = file_field.encode("latin-1")
                 filename = f"email_attachment_{i}.pdf"
             else:
@@ -433,25 +696,30 @@ async def email_incoming(request: Request):
 
             s3_key = build_s3_key(tenant_id, lead_id, filename)
             await upload_file(file_bytes, s3_key)
+            attachment_names.append({"filename": filename, "size": len(file_bytes), "s3_key": s3_key})
 
-            # Enqueue document processing (reuse whatsapp worker)
-            process_whatsapp_document.apply_async(
-                kwargs={
-                    "file_s3_key": s3_key,
-                    "lead_id": lead_id,
-                    "tenant_id": tenant_id,
-                    "original_filename": filename,
-                    "file_size_bytes": len(file_bytes),
-                    "waha_message_id": "",
-                },
-                queue="whatsapp",
+            # Process document directly (bypass Celery eager mode)
+            asyncio.create_task(
+                _run_doc_processing_pipeline(
+                    s3_key, lead_id, tenant_id, filename,
+                    len(file_bytes), "", channel="EMAIL",
+                )
             )
             processed += 1
-            logger.info(f"Email attachment queued: {filename} for lead_id={lead_id}")
+            logger.info(f"Email attachment processing started: {filename} for lead_id={lead_id}")
 
         except Exception as exc:
             logger.error(f"Failed to process email attachment {i} for lead_id={lead_id}: {exc}")
             continue
+
+    # Persist email message with attachment metadata
+    body_text = form.get("text", "") or form.get("html", "")
+    await db.email_messages.insert_one({
+        "lead_id": lead_id, "tenant_id": tenant_id,
+        "direction": "INBOUND", "from_email": raw_email,
+        "subject": subject, "body_text": str(body_text)[:500],
+        "attachments": attachment_names, "received_at": now,
+    })
 
     logger.info(f"Email processed: {processed}/{attachments_count} attachments for lead_id={lead_id}")
     return _ok(f"Processed {processed} attachments")

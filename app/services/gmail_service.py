@@ -159,18 +159,17 @@ async def process_new_messages(notification_history_id: str):
 
     from app.database import get_db
     from app.services.storage_service import upload_file, build_s3_key
-    from app.workers.whatsapp_worker import process_whatsapp_document
 
     db = get_db()
     now = datetime.now(timezone.utc)
 
     for msg_id in msg_ids:
-        await _process_single_message(loop, service, db, msg_id, now, upload_file, build_s3_key, process_whatsapp_document)
+        await _process_single_message(loop, service, db, msg_id, now, upload_file, build_s3_key)
 
     await save_history_id(new_history_id)
 
 
-async def _process_single_message(loop, service, db, msg_id, now, upload_file, build_s3_key, process_whatsapp_document):
+async def _process_single_message(loop, service, db, msg_id, now, upload_file, build_s3_key):
     try:
         msg = await loop.run_in_executor(
             None,
@@ -201,10 +200,13 @@ async def _process_single_message(loop, service, db, msg_id, now, upload_file, b
             "lead_id": lead_id,
             "event_type": "EMAIL_RECEIVED",
             "message": f"Email received from {sender_email}: {subject[:80]}",
+            "subject": subject,
+            "from_email": sender_email,
             "created_at": now,
         })
 
         parts = _get_all_parts(msg["payload"])
+        attachment_names = []
         processed = 0
 
         for part in parts:
@@ -232,23 +234,29 @@ async def _process_single_message(loop, service, db, msg_id, now, upload_file, b
                 s3_key = build_s3_key(tenant_id, lead_id, filename)
                 await upload_file(file_bytes, s3_key)
 
-                process_whatsapp_document.apply_async(
-                    kwargs={
-                        "file_s3_key": s3_key,
-                        "lead_id": lead_id,
-                        "tenant_id": tenant_id,
-                        "original_filename": filename,
-                        "file_size_bytes": len(file_bytes),
-                        "waha_message_id": "",
-                    },
-                    queue="whatsapp",
+                attachment_names.append({"filename": filename, "size": len(file_bytes), "s3_key": s3_key})
+
+                # Process document directly (bypass Celery eager mode)
+                from app.routes.webhooks import _run_doc_processing_pipeline
+                asyncio.create_task(
+                    _run_doc_processing_pipeline(
+                        s3_key, lead_id, tenant_id, filename,
+                        len(file_bytes), "", channel="EMAIL",
+                    )
                 )
                 processed += 1
-                logger.info(f"Gmail: queued '{filename}' for lead_id={lead_id}")
+                logger.info(f"Gmail: processing started for '{filename}' lead_id={lead_id}")
 
             except Exception as exc:
                 logger.error(f"Gmail: failed to process '{filename}': {exc}")
 
+        # Persist email message record
+        await db.email_messages.insert_one({
+            "lead_id": lead_id, "tenant_id": tenant_id,
+            "direction": "INBOUND", "from_email": sender_email,
+            "subject": subject, "body_text": "",
+            "attachments": attachment_names, "received_at": now,
+        })
         logger.info(f"Gmail: {processed} attachment(s) processed from {sender_email}")
 
     except Exception as exc:

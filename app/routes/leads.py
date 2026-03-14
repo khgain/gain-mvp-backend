@@ -172,6 +172,12 @@ async def create_lead(
 
     if body.mobile:
         doc["mobile"] = encrypt_field(body.mobile)
+        # Compute mobile_hash at creation time (enables inbound WhatsApp matching)
+        try:
+            from app.services.whatsapp_service import compute_mobile_hash
+            doc["mobile_hash"] = compute_mobile_hash(body.mobile)
+        except Exception:
+            pass
 
     result = await db.leads.insert_one(doc)
     lead_id = str(result.inserted_id)
@@ -250,6 +256,11 @@ async def bulk_create_leads(
             existing_pan_hashes.add(pan_hash)
         if lead.mobile:
             doc["mobile"] = encrypt_field(lead.mobile)
+            try:
+                from app.services.whatsapp_service import compute_mobile_hash
+                doc["mobile_hash"] = compute_mobile_hash(lead.mobile)
+            except Exception:
+                pass
         docs.append(doc)
 
     count = 0
