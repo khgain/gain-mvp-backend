@@ -217,25 +217,26 @@ async def whatsapp_incoming(request: Request):
     db = get_db()
     now = datetime.now(timezone.utc)
 
-    # Tenant detection: WAHA session name can carry tenant_id, or we search all active tenants.
-    # MVP: search across all tenants (acceptable for single-tenant deployment).
+    # Tenant detection: WAHA session name can carry tenant_id, or we search directly.
+    # MVP: single-tenant — search leads collection directly by mobile_hash.
     lead = None
+    tenant_id = None
     if sender_chat_id:
-        # Try each active tenant (in production, session name = tenant_id)
+        # Try session-based tenant_id first (production: session name = tenant_id)
         session = payload.get("session", "default")
-        # If session name encodes tenant_id (e.g. "tenant_69b..."), extract it
         tenant_id = _extract_tenant_from_session(session)
 
         if tenant_id:
             lead = await find_lead_by_whatsapp_number(db, tenant_id, sender_chat_id)
         else:
-            # Search across all tenants (MVP fallback)
-            async for tenant_doc in db.tenants.find({"is_active": True}):
-                tid = str(tenant_doc["_id"])
-                lead = await find_lead_by_whatsapp_number(db, tid, sender_chat_id)
-                if lead:
-                    tenant_id = tid
-                    break
+            # MVP fallback: search leads directly by mobile_hash (no tenant filter)
+            from app.services.whatsapp_service import compute_mobile_hash
+            digits = sender_chat_id.split("@")[0]
+            mobile_hash = compute_mobile_hash(digits)
+            lead = await db.leads.find_one({"mobile_hash": mobile_hash})
+            if lead:
+                tenant_id = lead["tenant_id"]
+                logger.info(f"WhatsApp: found lead by direct mobile_hash lookup — lead_id={lead['_id']} tenant_id={tenant_id}")
 
     if not lead:
         logger.info(f"WhatsApp: no lead found for sender={sender_chat_id} — ignoring")
@@ -354,7 +355,6 @@ async def _process_incoming_media(
 
     # Process document directly (bypass Celery eager mode issues)
     import asyncio
-    from app.workers.whatsapp_worker import _process_doc_async
     asyncio.create_task(
         _run_doc_processing_pipeline(
             s3_key, lead_id, tenant_id, original_filename,
@@ -574,6 +574,7 @@ async def _run_doc_processing_pipeline(
             return
 
         # Check if all required docs passed → trigger Tier 2
+        tier2_passed = False  # Default — set to True only if Tier 2 runs and passes
         all_passed = await check_all_required_docs_passed(db, lead_id, tenant_id)
         if all_passed:
             logger.info(f"[DOC PIPELINE] All required docs T1 passed — running Tier 2 for lead_id={lead_id}")
