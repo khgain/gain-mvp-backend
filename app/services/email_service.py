@@ -313,6 +313,47 @@ async def send_doc_status_update_email(
         return False
 
 
+async def send_status_update_email(
+    lead_id: str,
+    tenant_id: str,
+    borrower_email: str,
+    subject: str,
+    body_html: str,
+) -> bool:
+    """Send a generic status update email with HTML body."""
+    if not settings.SENDGRID_API_KEY:
+        logger.warning("SENDGRID_API_KEY not set — skipping status email")
+        return False
+
+    payload = {
+        "personalizations": [{"to": [{"email": borrower_email}]}],
+        "from": {"email": _FROM_EMAIL, "name": _FROM_NAME},
+        "reply_to": {"email": _INBOUND_EMAIL, "name": _FROM_NAME},
+        "subject": subject,
+        "content": [{"type": "text/html", "value": f"<html><body>{body_html}</body></html>"}],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                SENDGRID_SEND_URL,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {settings.SENDGRID_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+            if resp.status_code in (200, 201, 202):
+                logger.info(f"Status update email sent to {borrower_email} for lead_id={lead_id}")
+                return True
+            else:
+                logger.error(f"SendGrid error {resp.status_code}: {resp.text[:200]}")
+                return False
+    except Exception as exc:
+        logger.error(f"Status update email failed for lead_id={lead_id}: {exc}")
+        return False
+
+
 async def log_outbound_email(
     db,
     lead_id: str,

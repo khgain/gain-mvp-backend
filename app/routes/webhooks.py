@@ -553,6 +553,9 @@ async def _run_doc_processing_pipeline(
         )
         logger.info(f"[DOC PIPELINE] Tier 1 {t1_status} for {doc_type} logical_doc_id={logical_doc_id}")
 
+        # --- Step 6: Send smart reply with doc status ---
+        await _send_doc_status_reply(db, lead_id, tenant_id, doc_type, tier1_passed, channel)
+
         if not tier1_passed:
             if on_failure_action == "NOTIFY_BORROWER_AND_CONTINUE":
                 await notify_tier1_failure(
@@ -590,8 +593,87 @@ async def _run_doc_processing_pipeline(
                 await advance_to_underwriting(lead_id, tenant_id)
                 logger.info(f"[DOC PIPELINE] Tier 2 PASSED → READY_FOR_UNDERWRITING lead_id={lead_id}")
 
+        # Send all-done notification if Tier 2 passed
+        if all_passed and tier2_passed:
+            await _send_doc_status_reply(db, lead_id, tenant_id, doc_type, True, channel, all_complete=True)
+
     except Exception as exc:
         logger.error(f"[DOC PIPELINE] Failed for lead_id={lead_id} file={original_filename}: {exc}", exc_info=True)
+
+
+async def _send_doc_status_reply(
+    db, lead_id: str, tenant_id: str, doc_type: str,
+    tier1_passed: bool, channel: str = "WHATSAPP", all_complete: bool = False,
+) -> None:
+    """Send a smart reply via WhatsApp and Email with doc status + missing docs list."""
+    from app.services.doc_tracker import get_missing_docs_summary
+
+    try:
+        summary = await get_missing_docs_summary(db, lead_id, tenant_id)
+        message = summary["message"]
+
+        if not message:
+            return
+
+        # Prefix with context about what just happened
+        doc_label = doc_type.replace("_", " ").title()
+        if all_complete:
+            header = "🎉 Great news!\n\n"
+        elif tier1_passed:
+            header = f"✅ Your {doc_label} has been verified successfully!\n\n"
+        else:
+            header = f"⚠️ There's an issue with your {doc_label}. Please check below.\n\n"
+
+        full_message = header + message
+
+        lead = await db.leads.find_one({"_id": ObjectId(lead_id), "tenant_id": tenant_id})
+        if not lead:
+            return
+
+        now = datetime.now(timezone.utc)
+
+        # Send via WhatsApp
+        try:
+            from app.utils.encryption import decrypt_field
+            from app.services.whatsapp_service import send_text_message
+            mobile_raw = decrypt_field(lead.get("mobile", ""))
+            if mobile_raw:
+                await send_text_message(lead_id, mobile_raw, full_message)
+                await db.whatsapp_messages.insert_one({
+                    "lead_id": lead_id, "tenant_id": tenant_id,
+                    "direction": "OUTBOUND", "message_type": "TEXT",
+                    "content": full_message, "status": "SENT",
+                    "template_name": "DOC_STATUS_UPDATE", "sent_at": now,
+                })
+                logger.info(f"[DOC PIPELINE] Sent doc status update via WhatsApp for lead_id={lead_id}")
+        except Exception as exc:
+            logger.warning(f"[DOC PIPELINE] WhatsApp status reply failed: {exc}")
+
+        # Send via Email
+        try:
+            borrower_email = lead.get("email", "")
+            if borrower_email:
+                from app.services.email_service import send_status_update_email
+                email_body = full_message.replace("\n", "<br>")
+                subject = "Document Status Update — Gain AI" if not all_complete else "All Documents Verified — Gain AI"
+                await send_status_update_email(
+                    lead_id=lead_id, tenant_id=tenant_id,
+                    borrower_email=borrower_email,
+                    subject=subject,
+                    body_html=email_body,
+                )
+                await db.email_messages.insert_one({
+                    "lead_id": lead_id, "tenant_id": tenant_id,
+                    "direction": "OUTBOUND", "from_email": "demo.docs@unlockgain.com",
+                    "subject": subject, "body_text": full_message[:500],
+                    "attachments": [], "received_at": now,
+                })
+                logger.info(f"[DOC PIPELINE] Sent doc status update via Email for lead_id={lead_id}")
+        except Exception as exc:
+            logger.warning(f"[DOC PIPELINE] Email status reply failed: {exc}")
+
+    except Exception as exc:
+        logger.error(f"[DOC PIPELINE] _send_doc_status_reply failed: {exc}", exc_info=True)
 
 
 # ---------------------------------------------------------------------------

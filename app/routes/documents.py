@@ -69,6 +69,154 @@ def _serialize_logical_doc(doc: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# GET /leads/{lead_id}/doc-tracker — full checklist with status per doc
+# ---------------------------------------------------------------------------
+
+@router.get("/{lead_id}/doc-tracker")
+async def get_doc_tracker(
+    lead_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Return the full document checklist with receive/validation status for each item.
+    Used by the Documents tab to show required vs received vs validated.
+    """
+    db = get_db()
+    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    from app.services.doc_tracker import get_doc_status
+    tracker = await get_doc_status(db, lead_id, current_user.tenant_id)
+    return _success(tracker)
+
+
+# ---------------------------------------------------------------------------
+# GET /leads/{lead_id}/activity-timeline — activity feed + next planned action
+# ---------------------------------------------------------------------------
+
+@router.get("/{lead_id}/activity-timeline")
+async def get_activity_timeline(
+    lead_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Return activity timeline for a lead with all events and next planned action.
+    """
+    db = get_db()
+    lead = await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    # Fetch all activity events
+    events = []
+    async for ev in db.activity_feed.find(
+        {"lead_id": lead_id, "tenant_id": current_user.tenant_id},
+        sort=[("created_at", -1)],
+    ).to_list(200):
+        events.append({
+            "id": str(ev["_id"]),
+            "event_type": ev.get("event_type", ""),
+            "message": ev.get("message", ""),
+            "created_at": ev["created_at"].isoformat() if hasattr(ev.get("created_at"), "isoformat") else str(ev.get("created_at", "")),
+            "created_by": ev.get("created_by"),
+            "metadata": ev.get("metadata"),
+        })
+
+    # Compute next planned action based on lead status and doc state
+    from app.services.doc_tracker import get_doc_status
+    tracker = await get_doc_status(db, lead_id, current_user.tenant_id)
+    summary = tracker.get("summary", {})
+    lead_status = lead.get("status", "NEW")
+
+    next_action = _compute_next_action(lead_status, summary, lead)
+
+    return _success({
+        "events": events,
+        "total": len(events),
+        "next_action": next_action,
+    })
+
+
+def _compute_next_action(status: str, doc_summary: dict, lead: dict) -> dict:
+    """Determine the next planned action for a lead."""
+    from datetime import datetime, timezone, timedelta
+
+    now = datetime.now(timezone.utc)
+
+    if status == "NEW":
+        return {
+            "type": "PAN_VERIFICATION",
+            "label": "PAN verification pending",
+            "description": "Verify PAN to proceed with qualification call",
+            "scheduled_at": None,
+        }
+    elif status == "PAN_VERIFIED":
+        return {
+            "type": "QUALIFICATION_CALL",
+            "label": "Qualification call scheduled",
+            "description": "AI voice agent will call the borrower for qualification",
+            "scheduled_at": (now + timedelta(minutes=5)).isoformat(),
+        }
+    elif status == "QUALIFIED":
+        return {
+            "type": "DOC_COLLECTION",
+            "label": "Document collection starting",
+            "description": "Sending document checklist to borrower",
+            "scheduled_at": now.isoformat(),
+        }
+    elif status == "DOC_COLLECTION":
+        pending = doc_summary.get("pending", 0)
+        failed = doc_summary.get("failed", 0)
+        if pending > 0 or failed > 0:
+            # Calculate next follow-up based on last activity
+            updated_at = lead.get("updated_at", now)
+            days_since = (now - updated_at).days if hasattr(updated_at, "days") else 0
+            next_followup_days = [1, 3, 5, 7]
+            next_day = next(
+                (d for d in next_followup_days if d > days_since), 7
+            )
+            followup_time = updated_at + timedelta(days=next_day) if hasattr(updated_at, "__add__") else now + timedelta(days=next_day)
+
+            items = []
+            if pending > 0:
+                items.append(f"{pending} document(s) pending")
+            if failed > 0:
+                items.append(f"{failed} document(s) need resubmission")
+
+            return {
+                "type": "FOLLOW_UP",
+                "label": f"Follow-up reminder (Day {next_day})",
+                "description": f"Waiting for borrower: {', '.join(items)}",
+                "scheduled_at": followup_time.isoformat() if hasattr(followup_time, "isoformat") else None,
+            }
+        else:
+            return {
+                "type": "VALIDATION",
+                "label": "Document validation in progress",
+                "description": "All documents received — running AI validation checks",
+                "scheduled_at": None,
+            }
+    elif status == "READY_FOR_UNDERWRITING":
+        return {
+            "type": "UNDERWRITING",
+            "label": "Ready for underwriting",
+            "description": "All validations passed — lead is ready for credit decision",
+            "scheduled_at": None,
+        }
+    elif status == "NOT_QUALIFIED":
+        return {
+            "type": "CLOSED",
+            "label": "Lead not qualified",
+            "description": "Lead did not meet qualification criteria",
+            "scheduled_at": None,
+        }
+    else:
+        return {
+            "type": "UNKNOWN",
+            "label": f"Status: {status}",
+            "description": "No automatic action configured for this status",
+            "scheduled_at": None,
+        }
+
+
+# ---------------------------------------------------------------------------
 # GET /leads/{lead_id}/documents — combined overview
 # ---------------------------------------------------------------------------
 
