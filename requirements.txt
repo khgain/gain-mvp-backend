@@ -10,7 +10,7 @@ bcrypt==4.2.0
 boto3==1.35.68
 botocore==1.35.68
 httpx==0.28.0
-anthropic==0.39.0
+anthropic>=0.49.0,<1.0
 python-dotenv==1.0.1
 celery[sqs]==5.4.0
 kombu==5.4.2
