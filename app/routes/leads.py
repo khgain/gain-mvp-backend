@@ -572,7 +572,8 @@ async def trigger_follow_up(
             html_body = _build_follow_up_email_html(
                 borrower_name, company_name, pending_docs, received_docs, failed_docs, all_done,
             )
-            subject = f"Document Status Update — {company_name} Loan Application"
+            from app.services.email_service import get_lead_email_subject
+            subject = f"Re: {get_lead_email_subject(company_name)}"
             results["email"] = await send_status_update_email(
                 lead_id=lead_id,
                 tenant_id=current_user.tenant_id,

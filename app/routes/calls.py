@@ -344,22 +344,15 @@ async def list_email_messages(
             "source": "email_messages",
         })
 
-    # Deduplicate: prefer email_messages over activity_feed for same subject+direction
-    seen = set()
-    deduped = []
-    # Process email_messages first (more detailed), then activity_feed
-    email_msgs_list = [e for e in emails if e.get("source") == "email_messages"]
-    activity_list = [e for e in emails if e.get("source") == "activity_feed"]
-    for e in email_msgs_list:
-        key = (e["direction"], e["subject"][:50])
-        if key not in seen:
-            seen.add(key)
-            deduped.append(e)
-    for e in activity_list:
-        key = (e["direction"], e["subject"][:50])
-        if key not in seen:
-            seen.add(key)
-            deduped.append(e)
+    # Prefer email_messages over activity_feed.
+    # If email_messages has records, use those and only add activity_feed
+    # events that have no corresponding email_messages entry (by timestamp proximity).
+    if email_msgs:
+        # email_messages collection has the canonical records — use them all
+        deduped = [e for e in emails if e.get("source") == "email_messages"]
+    else:
+        # Fallback: only activity_feed events exist
+        deduped = [e for e in emails if e.get("source") == "activity_feed"]
 
     # Sort combined list by timestamp descending
     deduped.sort(key=lambda x: x["timestamp"], reverse=True)

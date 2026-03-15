@@ -181,12 +181,12 @@ async def _send_reminder_for_day(
             )
             body_html = "\n".join(html_sections)
 
-            from app.services.email_service import send_status_update_email
+            from app.services.email_service import send_status_update_email, get_lead_email_subject
             await send_status_update_email(
                 lead_id=lead_id,
                 tenant_id=tenant_id,
                 borrower_email=email,
-                subject=f"{label}: Documents Pending — {company_name} Loan Application",
+                subject=f"Re: {get_lead_email_subject(company_name)}",
                 body_html=body_html,
             )
             logger.info(f"Day {day} email reminder sent for lead_id={lead_id}")

@@ -21,6 +21,15 @@ _INBOUND_EMAIL = "demo.docs@unlockgain.com"  # Borrowers reply/send docs to this
 _FROM_NAME = "Gain AI"
 
 
+def get_lead_email_subject(company_name: str) -> str:
+    """
+    Return the canonical email subject for a lead.
+    All outbound emails for the same lead use this subject so that
+    Gmail/Outlook keep them in one thread.
+    """
+    return f"{company_name} — Loan Application | Gain AI"
+
+
 def _inject(template: str, variables: dict) -> str:
     result = template
     for key, value in variables.items():
@@ -62,7 +71,8 @@ async def send_document_checklist_email(
         "loan_type": loan_type.replace("_", " ").title(),
         "doc_list": _fmt_text(doc_list),
     }
-    subject = _inject(subject_template, variables)
+    # Use unified subject for email threading; ignore per-template subject
+    subject = get_lead_email_subject(company_name)
     plain_body = _inject(body_template, variables)
     html_body = (
         f"<html><body><pre style='font-family:sans-serif;white-space:pre-wrap'>"
@@ -119,7 +129,8 @@ async def send_reminder_email(
     label = labels.get(day, "Reminder")
     doc_text = _fmt_text(pending_docs)
 
-    subject = f"{label}: Documents Pending — {company_name} Loan Application"
+    # Re: prefix keeps it in the same Gmail thread as the initial email
+    subject = f"Re: {get_lead_email_subject(company_name)}"
     body = (
         f"Dear {borrower_name},\n\n"
         f"This is a {label.lower()} regarding your loan application for {company_name}.\n\n"
@@ -213,8 +224,10 @@ async def send_doc_status_update_email(
     all_done = len(failed) == 0 and len(missing) == 0 and len(verified) > 0
 
     # Build email content
+    # All outbound emails use the same subject for threading
+    subject = f"Re: {get_lead_email_subject(company_name)}"
+
     if all_done:
-        subject = f"All Documents Received — {company_name} Application Under Review"
         plain = (
             f"Dear {borrower_name},\n\n"
             f"Great news! We have received and verified all required documents for your loan application.\n\n"
@@ -257,7 +270,7 @@ async def send_doc_status_update_email(
             )
 
         action_count = len(failed) + len(missing)
-        subject = f"Action Required: {action_count} Document(s) Needed — {company_name}"
+        # subject already set above (unified for threading)
         plain = (
             f"Dear {borrower_name},\n\n"
             f"Here is the current status of your loan application documents:\n\n"
