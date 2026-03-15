@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 
 from app.auth import get_current_user, CurrentUser
 from app.database import get_db
@@ -247,6 +247,23 @@ async def get_review_queue(
         elif isinstance(reasoning_obj, str):
             ai_reasoning = reasoning_obj
 
+        # Get lead-specific checklist doc names
+        checklist_docs = []
+        if lead:
+            try:
+                from app.services.validation_rules import get_doc_collection_config
+                config = await get_doc_collection_config(db, tid)
+                entity_type = lead.get("entity_type", "INDIVIDUAL")
+                entity_checklist = config.get("doc_checklist_by_entity_type", {}).get(
+                    entity_type, config.get("doc_checklist_by_entity_type", {}).get("INDIVIDUAL", {})
+                )
+                for doc_name in entity_checklist.get("required", []):
+                    checklist_docs.append(doc_name)
+                for doc_name in entity_checklist.get("optional", []):
+                    checklist_docs.append(doc_name)
+            except Exception:
+                pass
+
         result.append({
             "id": str(f["_id"]),
             "fileId": str(f["_id"]),
@@ -262,6 +279,7 @@ async def get_review_queue(
             "aiReasoning": ai_reasoning,
             "fileType": f.get("file_type"),
             "s3Key": f.get("s3_key"),
+            "checklistDocs": checklist_docs,
         })
 
     return _success(data=result, message=f"{total} files pending review")
@@ -285,7 +303,7 @@ async def get_review_queue_stats(current_user: CurrentUser = Depends(get_current
 @router.post("/documents/{file_id}/review")
 async def queue_review_file(
     file_id: str,
-    body: dict,
+    request: Request,
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
@@ -293,6 +311,7 @@ async def queue_review_file(
     Accepts {decision, doc_type, notes} without requiring lead_id in the URL.
     """
     from app.models.document import ReviewDecision, DocType
+    body = await request.json()
     db = get_db()
 
     phys_file = await db.phys_files.find_one({
