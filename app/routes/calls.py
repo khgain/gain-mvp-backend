@@ -55,9 +55,13 @@ def _serialize_call(doc: dict, include_transcript: bool = True) -> dict:
 
 
 def _isoformat(val) -> str:
-    """Safely convert datetime/any to ISO string."""
+    """Safely convert datetime/any to ISO string with Z suffix for UTC."""
     if hasattr(val, "isoformat"):
-        return val.isoformat()
+        s = val.isoformat()
+        # Motor strips tzinfo from UTC datetimes; append Z so browsers parse as UTC
+        if not s.endswith("Z") and "+" not in s and s[-1].isdigit():
+            s += "Z"
+        return s
     return str(val) if val else ""
 
 
@@ -322,7 +326,7 @@ async def list_email_messages(
             "from_email": ev.get("from_email", lead.get("email", "")),
             "body_preview": ev.get("message", ""),
             "attachments": ev.get("attachments", []),
-            "timestamp": ev["created_at"].isoformat() if hasattr(ev.get("created_at"), "isoformat") else str(ev.get("created_at", "")),
+            "timestamp": _isoformat(ev.get("created_at")),
             "source": "activity_feed",
         })
 
@@ -336,7 +340,7 @@ async def list_email_messages(
             "from_email": em.get("from_email", lead.get("email", "")),
             "body_preview": em.get("body_text", em.get("body_preview", "")),
             "attachments": em.get("attachments", []),
-            "timestamp": em["received_at"].isoformat() if hasattr(em.get("received_at"), "isoformat") else str(em.get("received_at", "")),
+            "timestamp": _isoformat(em.get("received_at")),
             "source": "email_messages",
         })
 
