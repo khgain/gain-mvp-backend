@@ -125,13 +125,29 @@ def classify_physical_file(
             "reasoning": "...",
         }
     """
+    _FAIL = {"doc_type": "OTHER", "confidence": 0, "ambiguity_type": "NORMAL"}
+
     if not settings.ANTHROPIC_API_KEY:
         logger.warning("ANTHROPIC_API_KEY not configured — returning OTHER classification")
-        return {"doc_type": "OTHER", "confidence": 0, "ambiguity_type": "NORMAL", "reasoning": "API key not configured"}
+        return {**_FAIL, "reasoning": "API key not configured"}
 
-    file_bytes = _download_from_s3(s3_key)
-    media_type = _detect_media_type(original_filename, file_bytes)
-    doc_block = _build_document_block(file_bytes, media_type)
+    # Step A: Download from S3
+    try:
+        logger.info(f"[CLASSIFY] Downloading from S3: {s3_key}")
+        file_bytes = _download_from_s3(s3_key)
+        logger.info(f"[CLASSIFY] Downloaded {len(file_bytes)} bytes from S3")
+    except Exception as exc:
+        logger.error(f"[CLASSIFY] S3 download FAILED for {s3_key}: {exc}", exc_info=True)
+        return {**_FAIL, "reasoning": f"S3 download failed: {exc}"}
+
+    # Step B: Build document block
+    try:
+        media_type = _detect_media_type(original_filename, file_bytes)
+        doc_block = _build_document_block(file_bytes, media_type)
+        logger.info(f"[CLASSIFY] Built doc block: media_type={media_type} b64_size~{len(file_bytes)*4//3}")
+    except Exception as exc:
+        logger.error(f"[CLASSIFY] Doc block build FAILED: {exc}", exc_info=True)
+        return {**_FAIL, "reasoning": f"Doc block build failed: {exc}"}
 
     doc_types_str = ", ".join(_ALL_DOC_TYPES)
     prompt = f"""You are a document classifier for an Indian SME lending platform.
@@ -151,16 +167,24 @@ Financial years run April to March.
 
 Return ONLY the JSON object, no other text."""
 
-    client = _get_anthropic_client()
-    response = client.messages.create(
-        model=_HAIKU,
-        max_tokens=512,
-        messages=[{
-            "role": "user",
-            "content": [doc_block, {"type": "text", "text": prompt}],
-        }],
-    )
+    # Step C: Call Anthropic API
+    try:
+        logger.info(f"[CLASSIFY] Calling Anthropic API model={_HAIKU} for {original_filename}")
+        client = _get_anthropic_client()
+        response = client.messages.create(
+            model=_HAIKU,
+            max_tokens=512,
+            messages=[{
+                "role": "user",
+                "content": [doc_block, {"type": "text", "text": prompt}],
+            }],
+        )
+        logger.info(f"[CLASSIFY] Anthropic API responded: stop_reason={response.stop_reason}")
+    except Exception as exc:
+        logger.error(f"[CLASSIFY] Anthropic API call FAILED for {original_filename}: {exc}", exc_info=True)
+        return {**_FAIL, "reasoning": f"Anthropic API error: {exc}"}
 
+    # Step D: Parse response
     try:
         result = _parse_json_response(response.content[0].text)
         result.setdefault("doc_type", "OTHER")
@@ -168,13 +192,13 @@ Return ONLY the JSON object, no other text."""
         result.setdefault("ambiguity_type", "NORMAL")
         result.setdefault("reasoning", "")
         logger.info(
-            f"Classified {original_filename}: type={result['doc_type']} "
+            f"[CLASSIFY] Success: {original_filename} → type={result['doc_type']} "
             f"confidence={result['confidence']} ambiguity={result['ambiguity_type']}"
         )
         return result
     except Exception as exc:
-        logger.error(f"Classification JSON parse error for {s3_key}: {exc}")
-        return {"doc_type": "OTHER", "confidence": 0, "ambiguity_type": "NORMAL", "reasoning": str(exc)}
+        logger.error(f"[CLASSIFY] JSON parse error for {s3_key}: {exc} raw={response.content[0].text[:200]}")
+        return {**_FAIL, "reasoning": str(exc)}
 
 
 # ---------------------------------------------------------------------------
