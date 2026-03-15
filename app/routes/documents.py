@@ -505,8 +505,72 @@ async def list_logical_docs(
 
 
 # ---------------------------------------------------------------------------
-# GET /leads/{lead_id}/validation — Tier 1 + Tier 2 results for frontend
+# GET /leads/{lead_id}/validation — Per-document grouped validation results
 # ---------------------------------------------------------------------------
+
+# Mapping from human-readable checklist names → doc_type enum values
+_CHECKLIST_NAME_TO_DOC_TYPE: dict[str, str] = {
+    "aadhaar": "AADHAAR",
+    "aadhaar card": "AADHAAR",
+    "aadhaar card (front & back)": "AADHAAR",
+    "aadhaar card of all partners": "AADHAAR",
+    "aadhaar + pan of all directors": "AADHAAR",
+    "pan card": "PAN_CARD",
+    "pan card of firm and partners": "PAN_CARD",
+    "bank statement": "BANK_STATEMENT",
+    "bank statement (last 12 months)": "BANK_STATEMENT",
+    "itr": "ITR",
+    "latest itr": "ITR",
+    "latest itr with computation": "ITR",
+    "latest 2 years itr / audited p&l": "ITR",
+    "gst certificate": "GST_CERT",
+    "gst returns": "GST_RETURN",
+    "gst returns (last 6 months)": "GST_RETURN",
+    "udyam registration certificate": "UDYAM",
+    "office address proof": "ADDRESS_PROOF",
+    "address proof": "ADDRESS_PROOF",
+    "partnership deed": "PARTNERSHIP_DEED",
+    "certificate of incorporation (coi)": "COI",
+    "moa + aoa": "MOA",
+    "audited p&l + balance sheet (2 years)": "AUDITED_PL",
+}
+
+
+def _checklist_name_to_doc_type(name: str) -> str:
+    """Convert a human-readable checklist name to a doc_type enum value."""
+    return _CHECKLIST_NAME_TO_DOC_TYPE.get(name.lower().strip(), name.upper().replace(" ", "_"))
+
+
+def _pretty_label(doc_type: str) -> str:
+    """PAN_CARD → Pan Card, GST_CERT → GST Certificate, etc."""
+    nice = {
+        "AADHAAR": "Aadhaar Card",
+        "PAN_CARD": "PAN Card",
+        "BANK_STATEMENT": "Bank Statement",
+        "ITR": "ITR",
+        "GST_CERT": "GST Certificate",
+        "GST_RETURN": "GST Return",
+        "UDYAM": "Udyam Certificate",
+        "ADDRESS_PROOF": "Address Proof",
+        "PARTNERSHIP_DEED": "Partnership Deed",
+        "COI": "Certificate of Incorporation",
+        "MOA": "MOA / AOA",
+        "AOA": "AOA",
+        "AUDITED_PL": "Audited P&L / Balance Sheet",
+        "ELECTRICITY_BILL": "Electricity Bill",
+        "PASSPORT_PHOTO": "Passport Photo",
+    }
+    return nice.get(doc_type, doc_type.replace("_", " ").title())
+
+
+# Priority for picking the "best" logical doc when multiple exist for same type
+_STATUS_PRIORITY = {
+    "TIER1_PASSED": 0, "HUMAN_REVIEWED": 1, "TIER2_PASSED": 0,
+    "TIER1_FAILED": 2, "EXTRACTED": 3, "EXTRACTING": 4,
+    "READY_FOR_EXTRACTION": 5, "ASSEMBLING": 6, "PENDING": 7,
+    "REJECTED": 8, "NEEDS_HUMAN_REVIEW": 2,
+}
+
 
 @router.get("/{lead_id}/validation")
 async def get_lead_validation(
@@ -514,32 +578,119 @@ async def get_lead_validation(
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
-    Return Tier 1 and Tier 2 validation results for the Validation tab.
-    Tier 1: per-document results from logical_docs.tier1_validation
-    Tier 2: cross-document results from activity_feed (TIER2_VALIDATION_COMPLETE)
+    Return per-document grouped validation results for the Validation tab.
+
+    Response includes every required + optional document from the checklist,
+    with tier1 check details for received docs and "AWAITING" for unreceived.
+    Tier 2 cross-document results shown separately.
     """
     db = get_db()
-    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+    lead = await _get_lead_or_404(db, lead_id, current_user.tenant_id)
 
-    # Tier 1: collect from logical_docs that have tier1_validation
-    tier1 = []
+    entity_type = lead.get("entity_type", "INDIVIDUAL")
+
+    # 1. Get doc checklist config
+    from app.services.validation_rules import get_doc_collection_config
+    doc_config = await get_doc_collection_config(db, current_user.tenant_id)
+    entity_checklist = doc_config.get("doc_checklist_by_entity_type", {}).get(entity_type, {})
+    required_names = entity_checklist.get("required", [])
+    optional_names = entity_checklist.get("optional", [])
+
+    # Build ordered list of (doc_type, label, required)
+    checklist_items: list[tuple[str, str, bool]] = []
+    seen_types: set[str] = set()
+    for name in required_names:
+        dt = _checklist_name_to_doc_type(name)
+        if dt not in seen_types:
+            checklist_items.append((dt, name, True))
+            seen_types.add(dt)
+    for name in optional_names:
+        dt = _checklist_name_to_doc_type(name)
+        if dt not in seen_types:
+            checklist_items.append((dt, name, False))
+            seen_types.add(dt)
+
+    # 2. Fetch all logical_docs for this lead
+    logical_docs_by_type: dict[str, list[dict]] = {}
     async for doc in db.logical_docs.find(
-        {"lead_id": lead_id, "tenant_id": current_user.tenant_id, "tier1_validation": {"$ne": None}},
-        sort=[("created_at", 1)],
+        {"lead_id": lead_id, "tenant_id": current_user.tenant_id},
+        sort=[("created_at", -1)],
     ):
-        t1 = doc.get("tier1_validation", {})
-        for rule_result in t1.get("rule_results", []):
-            tier1.append({
-                "doc_type": doc.get("doc_type", "UNKNOWN"),
-                "document": doc.get("doc_type", "UNKNOWN"),
-                "rule_name": rule_result.get("rule_name", rule_result.get("rule_id", "—")),
-                "check": rule_result.get("rule_name", rule_result.get("rule_id", "—")),
-                "status": rule_result.get("status", "PENDING"),
-                "detail": rule_result.get("detail", rule_result.get("message", "")),
-                "message": rule_result.get("detail", rule_result.get("message", "")),
+        dt = doc.get("doc_type", "UNKNOWN")
+        logical_docs_by_type.setdefault(dt, []).append(doc)
+
+    # Also add any doc types found in DB but not in checklist
+    for dt in logical_docs_by_type:
+        if dt not in seen_types and dt != "UNKNOWN":
+            checklist_items.append((dt, _pretty_label(dt), False))
+            seen_types.add(dt)
+
+    # 3. Build per-document response
+    documents = []
+    summary = {"total_docs": 0, "received": 0, "passed": 0, "failed": 0, "awaiting": 0}
+
+    for doc_type, checklist_name, is_required in checklist_items:
+        summary["total_docs"] += 1
+        candidates = logical_docs_by_type.get(doc_type, [])
+
+        if not candidates:
+            # Document not yet received
+            summary["awaiting"] += 1
+            documents.append({
+                "doc_type": doc_type,
+                "label": _pretty_label(doc_type),
+                "checklist_name": checklist_name,
+                "required": is_required,
+                "received": False,
+                "status": "AWAITING",
+                "checks_passed": 0,
+                "checks_total": 0,
+                "checks": [],
+                "extracted_fields": {},
+            })
+            continue
+
+        # Pick the best logical doc (prefer passed > failed > others)
+        best = min(candidates, key=lambda d: _STATUS_PRIORITY.get(d.get("status", "PENDING"), 99))
+        doc_status = best.get("status", "PENDING")
+        t1 = best.get("tier1_validation") or {}
+        rule_results = t1.get("rule_results", [])
+        extracted = best.get("extracted_data") or {}
+
+        checks = []
+        passed_count = 0
+        for rr in rule_results:
+            is_passed = rr.get("passed", rr.get("status") == "PASS")
+            if is_passed:
+                passed_count += 1
+            # Try to find the extracted value relevant to this check
+            rule_name = rr.get("rule_name", rr.get("rule_id", ""))
+            checks.append({
+                "rule_name": rule_name,
+                "passed": bool(is_passed),
+                "message": rr.get("message", rr.get("detail", "")),
             })
 
-    # Tier 2: collect from activity_feed
+        summary["received"] += 1
+        if doc_status in ("TIER1_PASSED", "TIER2_PASSED", "HUMAN_REVIEWED"):
+            summary["passed"] += 1
+        elif doc_status == "TIER1_FAILED":
+            summary["failed"] += 1
+
+        documents.append({
+            "doc_type": doc_type,
+            "label": _pretty_label(doc_type),
+            "checklist_name": checklist_name,
+            "required": is_required,
+            "received": True,
+            "status": doc_status,
+            "checks_passed": passed_count,
+            "checks_total": len(rule_results),
+            "checks": checks,
+            "extracted_fields": {k: str(v) if v is not None else "" for k, v in extracted.items()},
+        })
+
+    # 4. Tier 2: cross-document results from activity_feed
     tier2 = []
     t2_events = await db.activity_feed.find(
         {"lead_id": lead_id, "tenant_id": current_user.tenant_id, "event_type": "TIER2_VALIDATION_COMPLETE"},
@@ -548,17 +699,20 @@ async def get_lead_validation(
 
     for event in t2_events:
         metadata = event.get("metadata", {})
-        for rule_result in metadata.get("rule_results", []):
+        for rr in metadata.get("rule_results", []):
+            is_passed = rr.get("passed", rr.get("status") == "PASS")
             tier2.append({
-                "rule_name": rule_result.get("rule_name", rule_result.get("rule_id", "—")),
-                "check": rule_result.get("rule_name", rule_result.get("rule_id", "—")),
-                "sources": rule_result.get("sources", []),
-                "status": rule_result.get("status", "PENDING"),
-                "detail": rule_result.get("detail", rule_result.get("message", "")),
-                "message": rule_result.get("detail", rule_result.get("message", "")),
+                "rule_name": rr.get("rule_name", rr.get("rule_id", "—")),
+                "passed": bool(is_passed),
+                "message": rr.get("message", rr.get("detail", "")),
+                "sources": rr.get("sources", []),
             })
 
-    return _success({"tier1": tier1, "tier2": tier2})
+    return _success({
+        "documents": documents,
+        "tier2": tier2,
+        "summary": summary,
+    })
 
 
 # ---------------------------------------------------------------------------
