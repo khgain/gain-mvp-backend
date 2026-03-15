@@ -227,6 +227,26 @@ async def get_review_queue(
         campaign = None
         if lead and lead.get("campaign_id"):
             campaign = await db.campaigns.find_one({"_id": ObjectId(str(lead["campaign_id"])), "tenant_id": tid})
+        # Format timestamp with Z suffix
+        created = f.get("created_at")
+        ts_str = ""
+        if hasattr(created, "isoformat"):
+            ts_str = created.isoformat()
+            if not ts_str.endswith("Z") and "+" not in ts_str:
+                ts_str += "Z"
+        else:
+            ts_str = str(created or "")
+
+        # Extract AI guess from classification_reasoning
+        reasoning_obj = f.get("classification_reasoning")
+        ai_guess = None
+        ai_reasoning = None
+        if isinstance(reasoning_obj, dict):
+            ai_guess = reasoning_obj.get("doc_type")
+            ai_reasoning = reasoning_obj.get("reasoning") or reasoning_obj.get("explanation")
+        elif isinstance(reasoning_obj, str):
+            ai_reasoning = reasoning_obj
+
         result.append({
             "id": str(f["_id"]),
             "fileId": str(f["_id"]),
@@ -236,11 +256,12 @@ async def get_review_queue(
             "campaignName": campaign.get("name") if campaign else None,
             "fileName": f.get("original_filename"),
             "channel": f.get("channel_received"),
-            "receivedAt": f.get("created_at"),
-            "aiGuess": f.get("classification_reasoning", {}).get("doc_type") if isinstance(f.get("classification_reasoning"), dict) else None,
+            "receivedAt": ts_str,
+            "aiGuess": ai_guess,
             "confidence": f.get("classification_confidence"),
-            "aiReasoning": f.get("classification_reasoning") if isinstance(f.get("classification_reasoning"), str) else None,
+            "aiReasoning": ai_reasoning,
             "fileType": f.get("file_type"),
+            "s3Key": f.get("s3_key"),
         })
 
     return _success(data=result, message=f"{total} files pending review")
@@ -254,6 +275,125 @@ async def get_review_queue_stats(current_user: CurrentUser = Depends(get_current
         {"tenant_id": current_user.tenant_id, "status": "NEEDS_HUMAN_REVIEW"}
     )
     return _success(data={"pending": pending})
+
+
+# ---------------------------------------------------------------------------
+# POST /documents/{file_id}/review — convenience endpoint for Review Queue page
+# Resolves lead_id from the phys_file automatically
+# ---------------------------------------------------------------------------
+
+@router.post("/documents/{file_id}/review")
+async def queue_review_file(
+    file_id: str,
+    body: dict,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Convenience wrapper for the review queue page.
+    Accepts {decision, doc_type, notes} without requiring lead_id in the URL.
+    """
+    from app.models.document import ReviewDecision, DocType
+    db = get_db()
+
+    phys_file = await db.phys_files.find_one({
+        "_id": ObjectId(file_id),
+        "tenant_id": current_user.tenant_id,
+    })
+    if not phys_file:
+        return {"success": False, "message": "File not found"}
+
+    lead_id = phys_file.get("lead_id")
+    now = datetime.now(timezone.utc)
+    decision = body.get("decision", "")
+    doc_type_str = body.get("doc_type", "")
+    notes = body.get("notes", "")
+
+    if decision == "CONFIRM_SINGLE":
+        if not doc_type_str:
+            return {"success": False, "message": "doc_type required for CONFIRM_SINGLE"}
+
+        # Normalise doc_type string to enum value
+        dt_upper = doc_type_str.upper().replace(" ", "_").replace("-", "_")
+        # Try matching DocType enum
+        try:
+            doc_type_enum = DocType(dt_upper)
+        except ValueError:
+            doc_type_enum = DocType.OTHER
+
+        result = await db.logical_docs.insert_one({
+            "lead_id": lead_id,
+            "tenant_id": current_user.tenant_id,
+            "doc_type": doc_type_enum.value,
+            "assembly_type": "SINGLE",
+            "physical_file_ids": [file_id],
+            "completeness_status": "COMPLETE",
+            "is_mandatory": True,
+            "extracted_data": {},
+            "status": "READY_FOR_EXTRACTION",
+            "created_at": now,
+            "updated_at": now,
+        })
+        logical_doc_id = str(result.inserted_id)
+
+        await db.phys_files.update_one(
+            {"_id": ObjectId(file_id)},
+            {"$set": {
+                "status": "HUMAN_REVIEWED",
+                "ambiguity_type": "NORMAL",
+                "reviewer_id": current_user.id,
+                "reviewed_at": now,
+                "review_notes": notes,
+                "updated_at": now,
+            }, "$addToSet": {"logical_doc_ids": logical_doc_id}},
+        )
+
+        # Activity feed
+        await db.activity_feed.insert_one({
+            "lead_id": lead_id,
+            "tenant_id": current_user.tenant_id,
+            "event_type": "DOCUMENT_RECEIVED",
+            "message": f"Document '{phys_file.get('original_filename', 'unknown')}' classified as {doc_type_enum.value.replace('_', ' ').title()} by reviewer"
+                       + (f" (note: {notes})" if notes else ""),
+            "created_at": now,
+            "created_by": current_user.id,
+        })
+
+        # Enqueue extraction (non-fatal)
+        try:
+            from app.workers.ai_worker import extract_document_data
+            extract_document_data.apply_async(
+                kwargs={"logical_doc_id": logical_doc_id, "tenant_id": current_user.tenant_id},
+                queue="ai-extraction",
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to enqueue extraction for {logical_doc_id}: {exc}")
+
+        return _success({"decision": "CONFIRM_SINGLE", "logical_doc_id": logical_doc_id}, "Document classified")
+
+    elif decision == "REJECT":
+        await db.phys_files.update_one(
+            {"_id": ObjectId(file_id)},
+            {"$set": {
+                "status": "HUMAN_REVIEWED",
+                "ambiguity_type": "NORMAL",
+                "reviewer_id": current_user.id,
+                "reviewed_at": now,
+                "review_notes": notes or "Rejected by reviewer",
+                "updated_at": now,
+            }},
+        )
+        await db.activity_feed.insert_one({
+            "lead_id": lead_id,
+            "tenant_id": current_user.tenant_id,
+            "event_type": "DOCUMENT_REJECTED",
+            "message": f"Document '{phys_file.get('original_filename', 'unknown')}' rejected by reviewer"
+                       + (f": {notes}" if notes else ""),
+            "created_at": now,
+            "created_by": current_user.id,
+        })
+        return _success({"decision": "REJECT"}, "Document rejected")
+
+    return {"success": False, "message": f"Unknown decision: {decision}"}
 
 
 # ---------------------------------------------------------------------------

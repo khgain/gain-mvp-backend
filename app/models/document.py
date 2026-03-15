@@ -155,6 +155,7 @@ class ReviewDecision(str, Enum):
     CONFIRM_SINGLE = "CONFIRM_SINGLE"
     SPLIT_BUNDLED = "SPLIT_BUNDLED"
     MARK_PARTIAL = "MARK_PARTIAL"
+    REJECT = "REJECT"
 
 
 class SplitDefinition(BaseModel):

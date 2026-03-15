@@ -401,12 +401,26 @@ async def submit_review(
             }, "$addToSet": {"logical_doc_ids": logical_doc_id}},
         )
 
+        # Log to activity feed
+        await db.activity_feed.insert_one({
+            "lead_id": lead_id,
+            "tenant_id": current_user.tenant_id,
+            "event_type": "DOCUMENT_RECEIVED",
+            "message": f"Document '{phys_file.get('original_filename', 'unknown')}' classified as {body.doc_type.value.replace('_', ' ').title()} by reviewer",
+            "created_at": now,
+            "created_by": current_user.id,
+        })
+
         # Enqueue extraction
-        from app.workers.ai_worker import extract_document_data
-        extract_document_data.apply_async(
-            kwargs={"logical_doc_id": logical_doc_id, "tenant_id": current_user.tenant_id},
-            queue="ai-extraction",
-        )
+        try:
+            from app.workers.ai_worker import extract_document_data
+            extract_document_data.apply_async(
+                kwargs={"logical_doc_id": logical_doc_id, "tenant_id": current_user.tenant_id},
+                queue="ai-extraction",
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to enqueue extraction for logical_doc_id={logical_doc_id}: {exc}")
+
         return _success({"decision": "CONFIRM_SINGLE", "logical_doc_id": logical_doc_id}, "Review submitted")
 
     elif body.decision.value == "SPLIT_BUNDLED":
@@ -464,6 +478,31 @@ async def submit_review(
             }},
         )
         return _success({"decision": "MARK_PARTIAL"}, "Marked as partial document")
+
+    elif body.decision.value == "REJECT":
+        # Mark phys file as rejected
+        await db.phys_files.update_one(
+            {"_id": ObjectId(file_id)},
+            {"$set": {
+                "status": "HUMAN_REVIEWED",
+                "ambiguity_type": "NORMAL",
+                "reviewer_id": current_user.id,
+                "reviewed_at": now,
+                "review_notes": body.notes or "Rejected by reviewer",
+                "updated_at": now,
+            }},
+        )
+        # Log to activity feed
+        await db.activity_feed.insert_one({
+            "lead_id": lead_id,
+            "tenant_id": current_user.tenant_id,
+            "event_type": "DOCUMENT_REJECTED",
+            "message": f"Document '{phys_file.get('original_filename', 'unknown')}' rejected by reviewer"
+                       + (f": {body.notes}" if body.notes else ""),
+            "created_at": now,
+            "created_by": current_user.id,
+        })
+        return _success({"decision": "REJECT"}, "Document rejected")
 
     raise HTTPException(status_code=400, detail="Unknown review decision")
 
