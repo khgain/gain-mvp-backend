@@ -11,18 +11,34 @@ db: AsyncIOMotorDatabase | None = None
 
 async def connect_to_mongo() -> None:
     global client, db
+    import asyncio
+
     logger.info("Connecting to MongoDB...")
     client = AsyncIOMotorClient(
         settings.MONGODB_URL,
         maxPoolSize=10,
         minPoolSize=1,
-        serverSelectionTimeoutMS=5000,
+        serverSelectionTimeoutMS=30000,  # 30s — Railway cold starts can be slow
+        connectTimeoutMS=20000,
+        socketTimeoutMS=20000,
         tlsCAFile=certifi.where(),  # Fix macOS SSL cert verification
     )
     db = client[settings.MONGODB_DATABASE]
-    # Verify connection
-    await client.admin.command("ping")
-    logger.info(f"Connected to MongoDB database: {settings.MONGODB_DATABASE}")
+
+    # Verify connection with retries (Railway IP changes can cause transient failures)
+    for attempt in range(3):
+        try:
+            await client.admin.command("ping")
+            logger.info(f"Connected to MongoDB database: {settings.MONGODB_DATABASE}")
+            break
+        except Exception as exc:
+            if attempt < 2:
+                logger.warning(f"MongoDB connection attempt {attempt + 1} failed: {exc} — retrying in 5s...")
+                await asyncio.sleep(5)
+            else:
+                logger.error(f"MongoDB connection failed after 3 attempts: {exc}")
+                raise
+
     await _create_indexes()
 
 
@@ -90,6 +106,16 @@ async def _create_indexes() -> None:
 
     # Lead mobile_hash — SHA256 of normalized mobile for WhatsApp sender matching
     await db.leads.create_index([("tenant_id", 1), ("mobile_hash", 1)], sparse=True)
+    await db.leads.create_index([("mobile_hash", 1)], sparse=True)  # For direct lookup without tenant
+
+    # Activity feed — also index by lead_id for Activity tab queries
+    await db.activity_feed.create_index([("lead_id", 1), ("tenant_id", 1), ("created_at", -1)])
+
+    # Email messages
+    await db.email_messages.create_index([("lead_id", 1), ("tenant_id", 1)])
+
+    # Webhook idempotency
+    await db.webhook_idempotency.create_index([("conversation_id", 1)], unique=True)
 
     # Lead pan_hash — SHA256 of uppercased PAN for deduplication (sparse: leads without PAN are exempt)
     try:
