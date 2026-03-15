@@ -214,7 +214,7 @@ def _get_validation_detail(ldoc: dict) -> Optional[str]:
     if not t1:
         return None
     results = t1.get("rule_results", [])
-    failed = [r for r in results if r.get("status") == "FAIL"]
+    failed = [r for r in results if r.get("status") == "FAIL" or r.get("passed") is False]
     if failed:
         return "; ".join(r.get("detail", r.get("message", "Failed")) for r in failed[:3])
     if t1.get("passed"):

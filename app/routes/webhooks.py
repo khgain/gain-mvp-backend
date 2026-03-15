@@ -181,7 +181,7 @@ async def whatsapp_incoming_test():
 
 
 @router.post("/whatsapp/incoming")
-async def whatsapp_incoming(request: Request):
+async def whatsapp_incoming(request: Request, background_tasks: BackgroundTasks):
     """
     WAHA posts here on every incoming WhatsApp message or document.
 
@@ -189,8 +189,8 @@ async def whatsapp_incoming(request: Request):
       1. Extract sender phone from WAHA payload
       2. Match sender to a lead via mobile_hash index
       3. Save message to whatsapp_messages collection
-      4. If media: download from WAHA, upload to S3, enqueue process_whatsapp_document
-      5. If text "HELP": resend checklist (enqueue send_doc_checklist_whatsapp)
+      4. If media: download from WAHA, upload to S3, run pipeline in background
+      5. If text "HELP": resend checklist
     """
     body_bytes = await request.body()
 
@@ -403,26 +403,50 @@ async def whatsapp_incoming(request: Request):
         logger.info(f"HELP command received — re-queued checklist for lead_id={lead_id}")
         return _ok("Checklist resent")
 
-    # Handle document (media)
+    # Handle document (media) — run in background so webhook returns fast for burst messages
     if has_media:
-        logger.info(f"[WA INBOUND] Processing media for lead_id={lead_id} msg_id={waha_message_id}")
-        try:
-            await _process_incoming_media(db, payload, msg, lead_id, tenant_id, waha_message_id, now)
-            logger.info(f"[WA INBOUND] _process_incoming_media completed for lead_id={lead_id}")
-        except Exception as exc:
-            logger.error(f"[WA INBOUND] _process_incoming_media CRASHED for lead_id={lead_id}: {exc}", exc_info=True)
+        logger.info(f"[WA INBOUND] Queuing media processing for lead_id={lead_id} msg_id={waha_message_id}")
 
-        # Send acknowledgment to borrower
-        try:
-            from app.services.whatsapp_service import send_text_message
-            from app.utils.encryption import decrypt_field
-            mobile_raw = decrypt_field(lead.get("mobile", ""))
-            if mobile_raw:
-                ack_msg = f"✅ Document received! We're reviewing it now. You'll get an update once processing is complete."
-                await send_text_message(lead_id, mobile_raw, ack_msg, tenant_id=tenant_id)
-                logger.info(f"Sent document receipt acknowledgment to lead_id={lead_id}")
-        except Exception as exc:
-            logger.warning(f"Failed to send document ack for lead_id={lead_id}: {exc}")
+        async def _background_media_task():
+            try:
+                await _process_incoming_media(db, payload, msg, lead_id, tenant_id, waha_message_id, now)
+                logger.info(f"[WA INBOUND] _process_incoming_media completed for lead_id={lead_id}")
+            except Exception as exc:
+                logger.error(f"[WA INBOUND] _process_incoming_media CRASHED for lead_id={lead_id}: {exc}", exc_info=True)
+
+            # Debounced acknowledgment — only send if no other doc arrived in the last 5 seconds
+            # This prevents spamming the borrower with "received!" for every doc in a burst
+            try:
+                import asyncio
+                await asyncio.sleep(5)  # wait 5s to see if more docs are coming
+                recent_docs = await db.whatsapp_messages.count_documents({
+                    "lead_id": lead_id,
+                    "direction": "INBOUND",
+                    "message_type": "DOCUMENT",
+                    "sent_at": {"$gte": now},
+                })
+                # Only send ack if this is the latest document (count hasn't grown since we slept)
+                current_count = await db.whatsapp_messages.count_documents({
+                    "lead_id": lead_id,
+                    "direction": "INBOUND",
+                    "message_type": "DOCUMENT",
+                    "sent_at": {"$gte": now},
+                })
+                if current_count == recent_docs:
+                    from app.services.whatsapp_service import send_text_message
+                    from app.utils.encryption import decrypt_field
+                    mobile_raw = decrypt_field(lead.get("mobile", ""))
+                    if mobile_raw:
+                        if recent_docs > 1:
+                            ack_msg = f"✅ {recent_docs} documents received! We're reviewing them now. You'll get updates once processing is complete."
+                        else:
+                            ack_msg = "✅ Document received! We're reviewing it now. You'll get an update once processing is complete."
+                        await send_text_message(lead_id, mobile_raw, ack_msg, tenant_id=tenant_id)
+                        logger.info(f"Sent document receipt ack ({recent_docs} docs) to lead_id={lead_id}")
+            except Exception as exc:
+                logger.warning(f"Failed to send document ack for lead_id={lead_id}: {exc}")
+
+        background_tasks.add_task(_background_media_task)
 
     return _ok("Received")
 
