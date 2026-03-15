@@ -37,11 +37,23 @@ def _serialize_call(doc: dict, include_transcript: bool = True) -> dict:
         result.pop("transcript", None)
         result.pop("transcript_raw", None)
 
+    # Datetime fields → ISO strings
+    for dt_field in ("initiated_at", "completed_at", "created_at", "updated_at"):
+        if dt_field in result and result[dt_field] is not None:
+            result[dt_field] = _isoformat(result[dt_field])
+
     return result
 
 
+def _isoformat(val) -> str:
+    """Safely convert datetime/any to ISO string."""
+    if hasattr(val, "isoformat"):
+        return val.isoformat()
+    return str(val) if val else ""
+
+
 def _serialize_message(doc: dict) -> dict:
-    """Convert a whatsapp_messages collection document to a serializable dict."""
+    """Convert a whatsapp_messages collection document to a JSON-serializable dict."""
     result = {**doc}
     result["id"] = str(doc["_id"])
     result.pop("_id", None)
@@ -49,6 +61,10 @@ def _serialize_message(doc: dict) -> dict:
         result["tenant_id"] = str(result["tenant_id"])
     if result.get("physical_file_id"):
         result["physical_file_id"] = str(result["physical_file_id"])
+    # Datetime fields → ISO strings (json.dumps can't handle raw datetime)
+    for dt_field in ("sent_at", "created_at", "updated_at", "received_at"):
+        if dt_field in result and result[dt_field] is not None:
+            result[dt_field] = _isoformat(result[dt_field])
     return result
 
 

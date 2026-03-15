@@ -106,7 +106,7 @@ async def get_activity_timeline(
 
     # Fetch all activity events
     events = []
-    async for ev in db.activity_feed.find(
+    for ev in await db.activity_feed.find(
         {"lead_id": lead_id, "tenant_id": current_user.tenant_id},
         sort=[("created_at", -1)],
     ).to_list(200):
