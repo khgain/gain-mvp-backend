@@ -228,15 +228,25 @@ async def whatsapp_incoming(request: Request):
 
         if tenant_id:
             lead = await find_lead_by_whatsapp_number(db, tenant_id, sender_chat_id)
+            logger.info(f"WhatsApp: session-based lookup tenant_id={tenant_id} found={lead is not None}")
         else:
             # MVP fallback: search leads directly by mobile_hash (no tenant filter)
             from app.services.whatsapp_service import compute_mobile_hash
             digits = sender_chat_id.split("@")[0]
             mobile_hash = compute_mobile_hash(digits)
+            logger.info(f"WhatsApp: direct mobile_hash lookup — digits={digits} hash={mobile_hash[:16]}...")
             lead = await db.leads.find_one({"mobile_hash": mobile_hash})
             if lead:
                 tenant_id = lead["tenant_id"]
-                logger.info(f"WhatsApp: found lead by direct mobile_hash lookup — lead_id={lead['_id']} tenant_id={tenant_id}")
+                logger.info(f"WhatsApp: found lead by direct mobile_hash — lead_id={lead['_id']} tenant_id={tenant_id}")
+            else:
+                # Debug: check how many leads have mobile_hash at all
+                total_leads = await db.leads.count_documents({})
+                leads_with_hash = await db.leads.count_documents({"mobile_hash": {"$exists": True}})
+                logger.warning(
+                    f"WhatsApp: NO lead found — sender={sender_chat_id} digits={digits} "
+                    f"hash={mobile_hash[:16]}... total_leads={total_leads} leads_with_hash={leads_with_hash}"
+                )
 
     if not lead:
         logger.info(f"WhatsApp: no lead found for sender={sender_chat_id} — ignoring")
@@ -271,7 +281,12 @@ async def whatsapp_incoming(request: Request):
 
     # Handle document (media)
     if has_media:
-        await _process_incoming_media(db, payload, msg, lead_id, tenant_id, waha_message_id, now)
+        logger.info(f"[WA INBOUND] Processing media for lead_id={lead_id} msg_id={waha_message_id}")
+        try:
+            await _process_incoming_media(db, payload, msg, lead_id, tenant_id, waha_message_id, now)
+            logger.info(f"[WA INBOUND] _process_incoming_media completed for lead_id={lead_id}")
+        except Exception as exc:
+            logger.error(f"[WA INBOUND] _process_incoming_media CRASHED for lead_id={lead_id}: {exc}", exc_info=True)
 
         # Send acknowledgment to borrower
         try:
@@ -323,19 +338,22 @@ async def _process_incoming_media(
         logger.warning(f"No message ID for media download — lead_id={lead_id}")
         return
 
+    download_url = f"{settings.WAHA_BASE_URL.rstrip('/')}/api/messages/default/download/{msg_id}"
+    logger.info(f"[MEDIA] Downloading from WAHA: url={download_url} filename={original_filename} msg_id={msg_id}")
     try:
         # Download from WAHA: GET /api/messages/{session}/download/{messageId}
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.get(
-                f"{settings.WAHA_BASE_URL.rstrip('/')}/api/messages/default/download/{msg_id}",
+                download_url,
                 headers={"X-Api-Key": settings.WAHA_API_KEY},
             )
+            logger.info(f"[MEDIA] WAHA download response: status={resp.status_code} content_length={len(resp.content)}")
             resp.raise_for_status()
             file_bytes = resp.content
 
-        logger.info(f"Downloaded media from WAHA: {original_filename} ({len(file_bytes)} bytes)")
+        logger.info(f"[MEDIA] Downloaded media from WAHA: {original_filename} ({len(file_bytes)} bytes)")
     except Exception as exc:
-        logger.error(f"WAHA media download failed for lead_id={lead_id}: {exc}")
+        logger.error(f"[MEDIA] WAHA media download FAILED for lead_id={lead_id} url={download_url}: {exc}", exc_info=True)
         return
 
     # Upload to S3
@@ -881,3 +899,81 @@ async def trigger_follow_up_check():
 
     asyncio.create_task(run_follow_up_check_async())
     return _ok("Follow-up check started")
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic endpoint — check pipeline data for a lead (no auth, for debugging)
+# ---------------------------------------------------------------------------
+
+@router.get("/diagnostic/{lead_id}")
+async def diagnostic_lead(lead_id: str):
+    """Check all pipeline data for a lead — for debugging only. Remove in production."""
+    from app.database import get_db
+    from bson import ObjectId
+
+    db = get_db()
+
+    try:
+        lead_oid = ObjectId(lead_id)
+    except Exception:
+        return {"error": "Invalid lead_id"}
+
+    lead = await db.leads.find_one({"_id": lead_oid})
+    if not lead:
+        return {"error": "Lead not found"}
+
+    tenant_id = lead.get("tenant_id", "")
+    mobile_hash = lead.get("mobile_hash", "MISSING")
+
+    # Count records in each collection
+    wa_count = await db.whatsapp_messages.count_documents({"lead_id": lead_id})
+    wa_inbound = await db.whatsapp_messages.count_documents({"lead_id": lead_id, "direction": "INBOUND"})
+    wa_outbound = await db.whatsapp_messages.count_documents({"lead_id": lead_id, "direction": "OUTBOUND"})
+    email_count = await db.email_messages.count_documents({"lead_id": lead_id})
+    email_inbound = await db.email_messages.count_documents({"lead_id": lead_id, "direction": "INBOUND"})
+    email_outbound = await db.email_messages.count_documents({"lead_id": lead_id, "direction": "OUTBOUND"})
+    activity_count = await db.activity_feed.count_documents({"lead_id": lead_id})
+    activity_with_tenant = await db.activity_feed.count_documents({"lead_id": lead_id, "tenant_id": tenant_id})
+    phys_files_count = await db.phys_files.count_documents({"lead_id": lead_id})
+    logical_docs_count = await db.logical_docs.count_documents({"lead_id": lead_id})
+
+    # Get last 5 activity events
+    activities = []
+    async for ev in db.activity_feed.find({"lead_id": lead_id}).sort("created_at", -1).to_list(5):
+        activities.append({
+            "event_type": ev.get("event_type"),
+            "message": ev.get("message", "")[:100],
+            "tenant_id": ev.get("tenant_id"),
+            "created_at": str(ev.get("created_at", "")),
+        })
+
+    # Get last 5 WA messages
+    wa_msgs = []
+    async for m in db.whatsapp_messages.find({"lead_id": lead_id}).sort("sent_at", -1).to_list(5):
+        wa_msgs.append({
+            "direction": m.get("direction"),
+            "message_type": m.get("message_type"),
+            "content": m.get("content", "")[:80],
+            "tenant_id": m.get("tenant_id"),
+            "sent_at": str(m.get("sent_at", "")),
+        })
+
+    # Check tenants collection
+    tenant_count = await db.tenants.count_documents({})
+    active_tenants = await db.tenants.count_documents({"is_active": True})
+
+    return {
+        "lead_id": lead_id,
+        "tenant_id": tenant_id,
+        "status": lead.get("status"),
+        "mobile_hash": mobile_hash[:16] + "..." if mobile_hash != "MISSING" else "MISSING",
+        "has_email": bool(lead.get("email")),
+        "tenants": {"total": tenant_count, "active": active_tenants},
+        "whatsapp_messages": {"total": wa_count, "inbound": wa_inbound, "outbound": wa_outbound},
+        "email_messages": {"total": email_count, "inbound": email_inbound, "outbound": email_outbound},
+        "activity_feed": {"total": activity_count, "with_tenant_filter": activity_with_tenant},
+        "phys_files": phys_files_count,
+        "logical_docs": logical_docs_count,
+        "recent_activities": activities,
+        "recent_wa_messages": wa_msgs,
+    }
