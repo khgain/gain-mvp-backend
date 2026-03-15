@@ -398,7 +398,7 @@ async def queue_review_file(
                 {"$set": {
                     "status": "HUMAN_REVIEWED",
                     "ambiguity_type": "NORMAL",
-                    "reviewer_id": current_user.id,
+                    "reviewer_id": current_user.user_id,
                     "reviewed_at": now,
                     "review_notes": notes,
                     "updated_at": now,
@@ -414,7 +414,7 @@ async def queue_review_file(
                 "message": f"Document '{phys_file.get('original_filename', 'unknown')}' classified as {doc_type_enum.value.replace('_', ' ').title()} by reviewer"
                            + (f" (note: {notes})" if notes else ""),
                 "created_at": now,
-                "created_by": current_user.id,
+                "created_by": current_user.user_id,
             })
 
             # Enqueue extraction (non-fatal)
@@ -435,7 +435,7 @@ async def queue_review_file(
                 {"$set": {
                     "status": "HUMAN_REVIEWED",
                     "ambiguity_type": "NORMAL",
-                    "reviewer_id": current_user.id,
+                    "reviewer_id": current_user.user_id,
                     "reviewed_at": now,
                     "review_notes": notes or "Rejected by reviewer",
                     "updated_at": now,
@@ -463,7 +463,7 @@ async def queue_review_file(
                 "message": f"Document '{phys_file.get('original_filename', 'unknown')}' rejected by reviewer"
                            + (f": {notes}" if notes else ""),
                 "created_at": now,
-                "created_by": current_user.id,
+                "created_by": current_user.user_id,
             })
             return _success({"decision": "REJECT"}, "Document rejected")
 
