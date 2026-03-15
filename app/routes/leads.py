@@ -425,12 +425,100 @@ async def trigger_agent(
     return _success(message=message)
 
 
+def _build_follow_up_wa_message(
+    name: str, company: str,
+    pending: list, received: list, failed: list, all_done: bool,
+) -> str:
+    """Build a WhatsApp follow-up message using real doc-tracker data."""
+    if all_done:
+        return (
+            f"Hi {name}! ✅\n\n"
+            f"Great news — all required documents for your"
+            f"{' ' + company if company else ''} loan application have been "
+            f"received and verified.\n\n"
+            f"Your application is now being processed. We'll update you shortly!"
+        )
+
+    parts = [f"Hi {name}, here's an update on your{' ' + company if company else ''} loan application:\n"]
+
+    if received:
+        parts.append(f"✅ *Received & Verified ({len(received)}):*")
+        for doc in received:
+            parts.append(f"   • {doc}")
+        parts.append("")
+
+    if failed:
+        parts.append(f"❌ *Needs Resubmission ({len(failed)}):*")
+        for f_doc in failed:
+            reason = f_doc.get("reason", "Validation failed") if isinstance(f_doc, dict) else "Validation failed"
+            doc_name = f_doc.get("name", f_doc) if isinstance(f_doc, dict) else f_doc
+            parts.append(f"   • {doc_name} — {reason}")
+        parts.append("")
+
+    if pending:
+        parts.append(f"📋 *Still Needed ({len(pending)}):*")
+        for i, doc in enumerate(pending, 1):
+            parts.append(f"   {i}. {doc}")
+        parts.append("")
+
+    parts.append("Please send the remaining documents to continue your application.")
+    return "\n".join(parts)
+
+
+def _build_follow_up_email_html(
+    name: str, company: str,
+    pending: list, received: list, failed: list, all_done: bool,
+) -> str:
+    """Build HTML email body using real doc-tracker data."""
+    sections = [f"<p>Dear {name},</p>"]
+
+    if all_done:
+        sections.append(
+            f"<p>Great news — all required documents for your"
+            f"{' ' + company if company else ''} loan application have been "
+            f"received and verified. Your application is now being processed.</p>"
+        )
+        sections.append("<p>Best regards,<br/>Gain AI Lending Team</p>")
+        return "\n".join(sections)
+
+    sections.append(
+        f"<p>Here is the current status of documents for your"
+        f"{' ' + company if company else ''} loan application:</p>"
+    )
+
+    if received:
+        sections.append("<p><strong>✅ Received & Verified:</strong></p><ul>")
+        for doc in received:
+            sections.append(f"<li>{doc}</li>")
+        sections.append("</ul>")
+
+    if failed:
+        sections.append("<p><strong>❌ Needs Resubmission:</strong></p><ul>")
+        for f_doc in failed:
+            reason = f_doc.get("reason", "Validation failed") if isinstance(f_doc, dict) else "Validation failed"
+            doc_name = f_doc.get("name", f_doc) if isinstance(f_doc, dict) else f_doc
+            sections.append(f"<li>{doc_name} — {reason}</li>")
+        sections.append("</ul>")
+
+    if pending:
+        sections.append("<p><strong>📋 Still Needed:</strong></p><ul>")
+        for doc in pending:
+            sections.append(f"<li>{doc}</li>")
+        sections.append("</ul>")
+
+    sections.append(
+        "<p>Please reply to this email with the pending documents attached.</p>"
+        "<p>Best regards,<br/>Gain AI Lending Team</p>"
+    )
+    return "\n".join(sections)
+
+
 @router.post("/{lead_id}/trigger-follow-up")
 async def trigger_follow_up(
     lead_id: str,
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    """Manually trigger follow-up reminders for a lead (for demo purposes)."""
+    """Manually trigger follow-up reminders using real doc-tracker status."""
     db = get_db()
     try:
         oid = ObjectId(lead_id)
@@ -443,37 +531,54 @@ async def trigger_follow_up(
     now = datetime.now(timezone.utc)
     results = {"whatsapp": False, "email": False}
 
-    # Send WhatsApp reminder
+    # ── Fetch real doc status from doc_tracker ──
+    from app.services.doc_tracker import get_missing_docs_summary
+    doc_summary = await get_missing_docs_summary(db, lead_id, current_user.tenant_id)
+    pending_docs = doc_summary.get("pending_docs", [])
+    received_docs = doc_summary.get("received_docs", [])
+    failed_docs = doc_summary.get("failed_docs", [])
+    all_done = doc_summary.get("all_done", False)
+
+    logger.info(
+        f"Follow-up doc status for lead_id={lead_id}: "
+        f"pending={len(pending_docs)} received={len(received_docs)} "
+        f"failed={len(failed_docs)} all_done={all_done}"
+    )
+
+    borrower_name = lead.get("name", "Borrower")
+    company_name = lead.get("company_name", borrower_name)
+
+    # Send WhatsApp reminder with real doc status
     try:
         from app.utils.encryption import decrypt_field
         mobile_raw = decrypt_field(lead.get("mobile", ""))
-        borrower_name = lead.get("name", "Borrower")
-        company_name = lead.get("company_name", borrower_name)
 
         if mobile_raw:
-            from app.services.whatsapp_service import send_reminder
-            results["whatsapp"] = await send_reminder(
-                lead_id=lead_id,
-                mobile=mobile_raw,
-                name=borrower_name,
-                day=1,
-                missing_count=3,  # placeholder count for demo
+            from app.services.whatsapp_service import send_text_message
+            wa_message = _build_follow_up_wa_message(
+                borrower_name, company_name, pending_docs, received_docs, failed_docs, all_done,
             )
+            await send_text_message(lead_id, mobile_raw, wa_message, tenant_id=current_user.tenant_id)
+            results["whatsapp"] = True
+            logger.info(f"WhatsApp follow-up sent — lead_id={lead_id}")
     except Exception as exc:
         logger.warning(f"Manual follow-up WhatsApp failed for lead_id={lead_id}: {exc}")
 
-    # Send email reminder
+    # Send email reminder with real doc status
     try:
         borrower_email = lead.get("email", "")
         if borrower_email:
-            from app.services.email_service import send_reminder_email
-            results["email"] = await send_reminder_email(
+            from app.services.email_service import send_status_update_email
+            html_body = _build_follow_up_email_html(
+                borrower_name, company_name, pending_docs, received_docs, failed_docs, all_done,
+            )
+            subject = f"Document Status Update — {company_name} Loan Application"
+            results["email"] = await send_status_update_email(
                 lead_id=lead_id,
-                borrower_name=lead.get("name", "Borrower"),
+                tenant_id=current_user.tenant_id,
                 borrower_email=borrower_email,
-                company_name=lead.get("company_name", ""),
-                pending_docs=["Bank Statement", "ITR", "PAN Card"],
-                day=1,
+                subject=subject,
+                body_html=html_body,
             )
     except Exception as exc:
         logger.warning(f"Manual follow-up email failed for lead_id={lead_id}: {exc}")
@@ -490,7 +595,16 @@ async def trigger_follow_up(
         "tenant_id": current_user.tenant_id,
         "lead_id": lead_id,
         "event_type": "FOLLOW_UP_TRIGGERED",
-        "message": f"Manual follow-up triggered by {current_user.email} via {channel_str}",
+        "message": (
+            f"Manual follow-up triggered by {current_user.email} via {channel_str}. "
+            f"{len(pending_docs)} pending, {len(received_docs)} received, {len(failed_docs)} failed."
+        ),
+        "detail": {
+            "pending_count": len(pending_docs),
+            "received_count": len(received_docs),
+            "failed_count": len(failed_docs),
+            "all_done": all_done,
+        },
         "created_by": current_user.user_id,
         "created_at": now,
     })
