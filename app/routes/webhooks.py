@@ -923,14 +923,24 @@ async def email_incoming(request: Request):
     if "<" in sender_email:
         raw_email = sender_email.split("<")[-1].rstrip(">").strip()
 
-    # Find lead by email
+    # Find lead by email — prefer the most recent lead in DOC_COLLECTION status
     from app.database import get_db
     from datetime import datetime, timezone
 
     db = get_db()
     now = datetime.now(timezone.utc)
 
-    lead = await db.leads.find_one({"email": raw_email})
+    # Same logic as WhatsApp: prefer DOC_COLLECTION, then most recent
+    email_candidates = await db.leads.find({"email": raw_email}).sort("created_at", -1).to_list(10)
+    lead = None
+    if email_candidates:
+        for c in email_candidates:
+            if c.get("status") == "DOC_COLLECTION":
+                lead = c
+                break
+        if not lead:
+            lead = email_candidates[0]  # fallback to most recent
+        logger.info(f"Email: matched lead_id={lead['_id']} status={lead.get('status')} (from {len(email_candidates)} candidates)")
     if not lead:
         logger.info(f"Email: no lead found for sender={raw_email}")
         return _ok("Lead not found")

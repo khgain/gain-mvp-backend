@@ -187,7 +187,17 @@ async def _process_single_message(loop, service, db, msg_id, now, upload_file, b
             sender_email = sender_raw.split("<")[-1].rstrip(">").strip()
         sender_email = sender_email.lower().strip()
 
-        lead = await db.leads.find_one({"email": sender_email})
+        # Prefer the most recent lead in DOC_COLLECTION status (same email on multiple leads)
+        candidates = await db.leads.find({"email": sender_email}).sort("created_at", -1).to_list(10)
+        lead = None
+        if candidates:
+            for c in candidates:
+                if c.get("status") == "DOC_COLLECTION":
+                    lead = c
+                    break
+            if not lead:
+                lead = candidates[0]
+            logger.info(f"Gmail: matched lead_id={lead['_id']} status={lead.get('status')} (from {len(candidates)} candidates)")
         if not lead:
             logger.info(f"Gmail: no lead for {sender_email} — skipping")
             return
