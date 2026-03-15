@@ -57,7 +57,18 @@ def _download_from_s3(s3_key: str) -> bytes:
 
 
 def _detect_media_type(filename: str, file_bytes: bytes) -> str:
-    """Detect media type from filename extension."""
+    """Detect media type from file magic bytes, falling back to extension."""
+    # Check magic bytes first — files from WhatsApp often have wrong extensions
+    if file_bytes[:4] == b"%PDF":
+        return "application/pdf"
+    if file_bytes[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if file_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if file_bytes[:4] == b"RIFF" and file_bytes[8:12] == b"WEBP":
+        return "image/webp"
+
+    # Fallback to extension
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
     mapping = {
         "pdf": "application/pdf",
@@ -65,7 +76,9 @@ def _detect_media_type(filename: str, file_bytes: bytes) -> str:
         "jpeg": "image/jpeg",
         "png": "image/png",
     }
-    return mapping.get(ext, "application/pdf")
+    detected = mapping.get(ext, "application/pdf")
+    logger.info(f"[DETECT] Magic bytes inconclusive for {filename}, using extension: {detected}")
+    return detected
 
 
 def _build_document_block(file_bytes: bytes, media_type: str) -> dict:
@@ -144,7 +157,10 @@ def classify_physical_file(
     try:
         media_type = _detect_media_type(original_filename, file_bytes)
         doc_block = _build_document_block(file_bytes, media_type)
-        logger.info(f"[CLASSIFY] Built doc block: media_type={media_type} b64_size~{len(file_bytes)*4//3}")
+        logger.info(
+            f"[CLASSIFY] Built doc block: media_type={media_type} b64_size~{len(file_bytes)*4//3} "
+            f"magic_bytes={file_bytes[:8].hex()} filename={original_filename}"
+        )
     except Exception as exc:
         logger.error(f"[CLASSIFY] Doc block build FAILED: {exc}", exc_info=True)
         return {**_FAIL, "reasoning": f"Doc block build failed: {exc}"}
