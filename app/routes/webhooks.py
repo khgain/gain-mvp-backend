@@ -939,7 +939,7 @@ async def diagnostic_lead(lead_id: str):
 
     # Get last 5 activity events
     activities = []
-    async for ev in db.activity_feed.find({"lead_id": lead_id}).sort("created_at", -1).to_list(5):
+    for ev in await db.activity_feed.find({"lead_id": lead_id}).sort("created_at", -1).to_list(5):
         activities.append({
             "event_type": ev.get("event_type"),
             "message": ev.get("message", "")[:100],
@@ -949,7 +949,7 @@ async def diagnostic_lead(lead_id: str):
 
     # Get last 5 WA messages
     wa_msgs = []
-    async for m in db.whatsapp_messages.find({"lead_id": lead_id}).sort("sent_at", -1).to_list(5):
+    for m in await db.whatsapp_messages.find({"lead_id": lead_id}).sort("sent_at", -1).to_list(5):
         wa_msgs.append({
             "direction": m.get("direction"),
             "message_type": m.get("message_type"),
