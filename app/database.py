@@ -13,9 +13,22 @@ async def connect_to_mongo() -> None:
     global client, db
     import asyncio
 
-    logger.info("Connecting to MongoDB...")
+    # Diagnostic: log connection string (masked) and DNS availability
+    url = settings.MONGODB_URL
+    is_srv = url.startswith("mongodb+srv://")
+    masked = url[:20] + "***" + url[-30:] if len(url) > 50 else "***"
+    logger.info(f"Connecting to MongoDB... SRV={is_srv} db={settings.MONGODB_DATABASE} url={masked}")
+
+    # Check dnspython is available (required for mongodb+srv://)
+    if is_srv:
+        try:
+            import dns.resolver
+            logger.info("dnspython available — SRV resolution OK")
+        except ImportError:
+            logger.error("dnspython NOT installed — mongodb+srv:// will fail! pip install dnspython")
+
     client = AsyncIOMotorClient(
-        settings.MONGODB_URL,
+        url,
         maxPoolSize=10,
         minPoolSize=1,
         serverSelectionTimeoutMS=30000,  # 30s — Railway cold starts can be slow
@@ -33,7 +46,7 @@ async def connect_to_mongo() -> None:
             break
         except Exception as exc:
             if attempt < 2:
-                logger.warning(f"MongoDB connection attempt {attempt + 1} failed: {exc} — retrying in 5s...")
+                logger.warning(f"MongoDB connection attempt {attempt + 1}/{3} failed: {exc} — retrying in 5s...")
                 await asyncio.sleep(5)
             else:
                 logger.error(f"MongoDB connection failed after 3 attempts: {exc}")

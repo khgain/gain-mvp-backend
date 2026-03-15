@@ -17,6 +17,7 @@ kombu==5.4.2
 cryptography==43.0.3
 python-multipart==0.0.17
 python-magic==0.4.27
+dnspython==2.7.0
 slowapi==0.1.9
 limits==3.13.0
 email-validator==2.2.0
