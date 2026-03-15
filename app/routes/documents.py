@@ -104,17 +104,40 @@ async def get_activity_timeline(
     db = get_db()
     lead = await _get_lead_or_404(db, lead_id, current_user.tenant_id)
 
-    # Fetch all activity events
+    # Fetch all activity events (deduped by event_type + message within 60s)
     events = []
+    seen_keys = {}  # (event_type, message) -> latest created_at timestamp
     for ev in await db.activity_feed.find(
         {"lead_id": lead_id, "tenant_id": current_user.tenant_id},
         sort=[("created_at", -1)],
     ).to_list(200):
+        evt_type = ev.get("event_type", "")
+        msg = ev.get("message", "")
+        created = ev.get("created_at")
+        dedup_key = (evt_type, msg)
+
+        # Skip duplicate if same event_type + message within 60 seconds
+        if dedup_key in seen_keys and created and hasattr(created, "timestamp"):
+            prev_ts = seen_keys[dedup_key]
+            if abs(prev_ts.timestamp() - created.timestamp()) < 60:
+                continue
+
+        if created and hasattr(created, "timestamp"):
+            seen_keys[dedup_key] = created
+
+        ts_str = ""
+        if hasattr(created, "isoformat"):
+            ts_str = created.isoformat()
+            if not ts_str.endswith("Z") and "+" not in ts_str:
+                ts_str += "Z"
+        else:
+            ts_str = str(created or "")
+
         events.append({
             "id": str(ev["_id"]),
-            "event_type": ev.get("event_type", ""),
-            "message": ev.get("message", ""),
-            "created_at": ev["created_at"].isoformat() if hasattr(ev.get("created_at"), "isoformat") else str(ev.get("created_at", "")),
+            "event_type": evt_type,
+            "message": msg,
+            "created_at": ts_str,
             "created_by": ev.get("created_by"),
             "metadata": ev.get("metadata") or ev.get("detail"),
         })
