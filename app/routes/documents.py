@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
 
 from app.auth import get_current_user, CurrentUser, require_role
@@ -762,6 +762,83 @@ async def get_upload_url(
         "filename": filename,
         "expires_in_seconds": 3600,
     })
+
+
+# ---------------------------------------------------------------------------
+# POST /leads/{lead_id}/upload-direct — upload file via backend (no CORS issues)
+# ---------------------------------------------------------------------------
+
+@router.post("/{lead_id}/upload-direct")
+async def upload_direct(
+    lead_id: str,
+    file: UploadFile = File(...),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Upload a file directly through the backend to S3, then trigger the
+    doc processing pipeline. Avoids S3 CORS issues with presigned URLs.
+    """
+    db = get_db()
+    await _get_lead_or_404(db, lead_id, current_user.tenant_id)
+
+    file_bytes = await file.read()
+    filename = file.filename or f"document_{int(time.time())}.pdf"
+    content_type = file.content_type or "application/octet-stream"
+
+    from app.services.storage_service import upload_file, build_s3_key
+    s3_key = build_s3_key(current_user.tenant_id, lead_id, filename)
+    await upload_file(file_bytes, s3_key, content_type)
+    logger.info(f"[PORTAL UPLOAD] Direct upload to S3: {s3_key} size={len(file_bytes)}")
+
+    now = datetime.now(timezone.utc)
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "other"
+    file_type_map = {"pdf": "PDF", "jpg": "JPG", "jpeg": "JPG", "png": "PNG", "zip": "ZIP"}
+    file_type = file_type_map.get(ext, "OTHER")
+    is_zip = file_type == "ZIP"
+
+    result = await db.phys_files.insert_one({
+        "lead_id": lead_id,
+        "tenant_id": current_user.tenant_id,
+        "original_filename": filename,
+        "channel_received": "PORTAL_UPLOAD",
+        "s3_key": s3_key,
+        "file_type": file_type,
+        "file_size_bytes": len(file_bytes),
+        "status": "EXTRACTING_ZIP" if is_zip else "RECEIVED",
+        "logical_doc_ids": [],
+        "created_at": now,
+        "updated_at": now,
+    })
+    phys_file_id = str(result.inserted_id)
+
+    await db.activity_feed.insert_one({
+        "tenant_id": current_user.tenant_id,
+        "lead_id": lead_id,
+        "event_type": "DOCUMENT_UPLOADED",
+        "message": f"Document uploaded via portal: {filename}",
+        "created_by": current_user.id,
+        "created_at": now,
+    })
+
+    if not is_zip:
+        from app.routes.webhooks import _run_doc_processing_pipeline
+        try:
+            await _run_doc_processing_pipeline(
+                file_s3_key=s3_key,
+                lead_id=lead_id,
+                tenant_id=current_user.tenant_id,
+                original_filename=filename,
+                file_size_bytes=len(file_bytes),
+                waha_message_id="",
+                channel="PORTAL_UPLOAD",
+            )
+            logger.info(f"[PORTAL UPLOAD] Pipeline completed for {filename} lead_id={lead_id}")
+        except Exception as exc:
+            logger.error(f"[PORTAL UPLOAD] Pipeline failed for {filename}: {exc}", exc_info=True)
+    else:
+        logger.info(f"[PORTAL UPLOAD] ZIP file uploaded — manual processing needed: {filename}")
+
+    return _success({"phys_file_id": phys_file_id, "status": "processing"}, "File uploaded and processing")
 
 
 # ---------------------------------------------------------------------------
