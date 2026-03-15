@@ -16,7 +16,7 @@ logger = get_logger("email_service")
 
 SENDGRID_SEND_URL = "https://api.sendgrid.com/v3/mail/send"
 
-_FROM_EMAIL = "ops@unlockgain.com"       # Verified SendGrid sender
+_FROM_EMAIL = "demo.docs@unlockgain.com"  # Verified SendGrid sender (also receives inbound)
 _INBOUND_EMAIL = "demo.docs@unlockgain.com"  # Borrowers reply/send docs to this address
 _FROM_NAME = "Gain AI"
 

@@ -18,7 +18,7 @@ import time
 from typing import Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Request, HTTPException, Header
+from fastapi import APIRouter, BackgroundTasks, Request, HTTPException, Header
 from fastapi.responses import JSONResponse
 
 from app.config import settings
@@ -561,15 +561,16 @@ async def _process_incoming_media(
         {"$set": {"media_s3_key": s3_key, "media_filename": original_filename}},
     )
 
-    # Process document directly (bypass Celery eager mode issues)
-    import asyncio
-    asyncio.create_task(
-        _run_doc_processing_pipeline(
+    # Process document directly — await to ensure pipeline completes
+    logger.info(f"[DOC PIPELINE] Starting for {original_filename} lead_id={lead_id}")
+    try:
+        await _run_doc_processing_pipeline(
             s3_key, lead_id, tenant_id, original_filename,
             len(file_bytes), waha_message_id
         )
-    )
-    logger.info(f"Media processing started: {original_filename} for lead_id={lead_id}")
+        logger.info(f"[DOC PIPELINE] Completed for {original_filename} lead_id={lead_id}")
+    except Exception as exc:
+        logger.error(f"[DOC PIPELINE] Failed for {original_filename} lead_id={lead_id}: {exc}", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -999,15 +1000,17 @@ async def email_incoming(request: Request):
             await upload_file(file_bytes, s3_key)
             attachment_names.append({"filename": filename, "size": len(file_bytes), "s3_key": s3_key})
 
-            # Process document directly (bypass Celery eager mode)
-            asyncio.create_task(
-                _run_doc_processing_pipeline(
+            # Process document directly — await to ensure pipeline completes
+            logger.info(f"[DOC PIPELINE] Starting email attachment: {filename} for lead_id={lead_id}")
+            try:
+                await _run_doc_processing_pipeline(
                     s3_key, lead_id, tenant_id, filename,
                     len(file_bytes), "", channel="EMAIL",
                 )
-            )
+                logger.info(f"[DOC PIPELINE] Completed email attachment: {filename} for lead_id={lead_id}")
+            except Exception as pipe_exc:
+                logger.error(f"[DOC PIPELINE] Failed email attachment {filename} for lead_id={lead_id}: {pipe_exc}", exc_info=True)
             processed += 1
-            logger.info(f"Email attachment processing started: {filename} for lead_id={lead_id}")
 
         except Exception as exc:
             logger.error(f"Failed to process email attachment {i} for lead_id={lead_id}: {exc}")
@@ -1031,7 +1034,7 @@ async def email_incoming(request: Request):
 # ---------------------------------------------------------------------------
 
 @router.post("/gmail-push")
-async def gmail_push_notification(request: Request):
+async def gmail_push_notification(request: Request, background_tasks: BackgroundTasks):
     """
     Google Cloud Pub/Sub pushes here instantly when a new email arrives
     at the Gmail inbox (demo.docs@unlockgain.com).
@@ -1069,10 +1072,9 @@ async def gmail_push_notification(request: Request):
         if not history_id:
             return _ok("No historyId")
 
-        # Process asynchronously — don't block the Pub/Sub acknowledgement
-        import asyncio
+        # Process in FastAPI background task — runs after response is sent
         from app.services.gmail_service import process_new_messages
-        asyncio.create_task(process_new_messages(history_id))
+        background_tasks.add_task(process_new_messages, history_id)
 
         # Must return 200 quickly to acknowledge the Pub/Sub message
         return _ok("Acknowledged")
@@ -1088,16 +1090,15 @@ async def gmail_push_notification(request: Request):
 # ---------------------------------------------------------------------------
 
 @router.post("/follow-up/trigger")
-async def trigger_follow_up_check():
+async def trigger_follow_up_check(background_tasks: BackgroundTasks):
     """
     Manually or cron-trigger the follow-up check.
     Runs doc-tracker-aware reminders for all leads in DOC_COLLECTION.
     Can be called by Railway cron, external scheduler, or manual API call.
     """
-    import asyncio
     from app.workers.follow_up_worker import run_follow_up_check_async
 
-    asyncio.create_task(run_follow_up_check_async())
+    background_tasks.add_task(run_follow_up_check_async)
     return _ok("Follow-up check started")
 
 

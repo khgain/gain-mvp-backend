@@ -57,7 +57,10 @@ def _hash_pan(pan: str) -> str:
 def _mask_mobile(mobile: str) -> str:
     if not mobile or len(mobile) < 4:
         return mobile
-    return "******" + mobile[-4:]
+    # Show first 2 digits + masked middle + last 4 digits  e.g. "91****0175"
+    if len(mobile) >= 10:
+        return mobile[:2] + "*" * (len(mobile) - 6) + mobile[-4:]
+    return "*" * (len(mobile) - 4) + mobile[-4:]
 
 
 def _serialize_lead(doc: dict) -> dict:
@@ -117,6 +120,23 @@ async def list_leads(
     skip = (page - 1) * page_size
     cursor = db.leads.find(query).sort("created_at", -1).skip(skip).limit(page_size)
     leads = [_serialize_lead(doc) async for doc in cursor]
+
+    # Enrich with campaign names
+    campaign_ids = list(set(l.get("campaign_id") for l in leads if l.get("campaign_id")))
+    campaign_map: dict = {}
+    if campaign_ids:
+        try:
+            oid_list = [ObjectId(cid) for cid in campaign_ids if ObjectId.is_valid(cid)]
+            if oid_list:
+                async for camp in db.campaigns.find({"_id": {"$in": oid_list}}, {"name": 1}):
+                    campaign_map[str(camp["_id"])] = camp.get("name", "")
+        except Exception:
+            pass
+    for lead in leads:
+        cid = lead.get("campaign_id")
+        if cid and cid in campaign_map:
+            lead["campaign_name"] = campaign_map[cid]
+
     return _success(data={
         "leads": leads,
         "total": total,
@@ -290,7 +310,17 @@ async def get_lead(
     lead = await db.leads.find_one({"_id": oid, "tenant_id": current_user.tenant_id})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
-    return _success(data=_serialize_lead(lead))
+    result = _serialize_lead(lead)
+    # Enrich with campaign name
+    cid = result.get("campaign_id")
+    if cid and ObjectId.is_valid(cid):
+        try:
+            camp = await db.campaigns.find_one({"_id": ObjectId(cid)}, {"name": 1})
+            if camp:
+                result["campaign_name"] = camp.get("name", "")
+        except Exception:
+            pass
+    return _success(data=result)
 
 
 @router.patch("/{lead_id}")

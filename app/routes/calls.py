@@ -256,8 +256,25 @@ async def list_email_messages(
             "source": "email_messages",
         })
 
-    # Sort combined list by timestamp descending
-    emails.sort(key=lambda x: x["timestamp"], reverse=True)
+    # Deduplicate: prefer email_messages over activity_feed for same subject+direction
+    seen = set()
+    deduped = []
+    # Process email_messages first (more detailed), then activity_feed
+    email_msgs_list = [e for e in emails if e.get("source") == "email_messages"]
+    activity_list = [e for e in emails if e.get("source") == "activity_feed"]
+    for e in email_msgs_list:
+        key = (e["direction"], e["subject"][:50])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(e)
+    for e in activity_list:
+        key = (e["direction"], e["subject"][:50])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(e)
 
-    logger.info(f"List emails — lead_id={lead_id} count={len(emails)}")
-    return _success(data=emails, message=f"{len(emails)} email(s) found")
+    # Sort combined list by timestamp descending
+    deduped.sort(key=lambda x: x["timestamp"], reverse=True)
+
+    logger.info(f"List emails — lead_id={lead_id} count={len(deduped)}")
+    return _success(data=deduped, message=f"{len(deduped)} email(s) found")
