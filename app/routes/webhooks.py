@@ -366,6 +366,20 @@ async def whatsapp_incoming(request: Request):
     }
     await db.whatsapp_messages.insert_one(msg_record)
 
+    # Log WhatsApp activity to activity_feed so it appears in Activity tab
+    wa_event_type = "WHATSAPP_DOCUMENT_RECEIVED" if has_media else "WHATSAPP_MESSAGE_RECEIVED"
+    wa_event_msg = (
+        f"Document received via WhatsApp" if has_media
+        else f"WhatsApp message received: {body_text[:100]}"
+    )
+    await db.activity_feed.insert_one({
+        "tenant_id": tenant_id,
+        "lead_id": lead_id,
+        "event_type": wa_event_type,
+        "message": wa_event_msg,
+        "created_at": now,
+    })
+
     # Handle HELP command — resend checklist
     if not has_media and body_text.upper() in ("HELP", "HELP ME", "CHECKLIST"):
         from app.workers.whatsapp_worker import send_doc_checklist_whatsapp

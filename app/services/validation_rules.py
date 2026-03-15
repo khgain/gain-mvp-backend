@@ -29,9 +29,22 @@ async def get_validation_agent_config(db, tenant_id: str) -> dict:
     )
     if agent and agent.get("config"):
         return agent["config"]
-    logger.warning(f"No active VALIDATION_AI agent for tenant_id={tenant_id} — using defaults")
-    # Return minimal defaults (empty rules → everything passes)
-    return {"tier1_rules": [], "tier2_rules": [], "on_tier1_failure_action": "NOTIFY_BORROWER_AND_CONTINUE", "on_tier2_failure_action": "FLAG_FOR_OPS_REVIEW"}
+    logger.warning(f"No active VALIDATION_AI agent for tenant_id={tenant_id} — using built-in defaults")
+    return {
+        "tier1_rules": _DEFAULT_TIER1_RULES,
+        "tier2_rules": [],
+        "on_tier1_failure_action": "NOTIFY_BORROWER_AND_CONTINUE",
+        "on_tier2_failure_action": "FLAG_FOR_OPS_REVIEW",
+        "tier1_failure_message_templates": {},
+    }
+
+
+# Default tier 1 validation rules (used when no VALIDATION_AI agent in DB)
+_DEFAULT_TIER1_RULES = [
+    {"rule": "file_size_minimum", "params": {"min_bytes": 10240}, "description": "File must be at least 10KB"},
+    {"rule": "file_not_blank", "params": {}, "description": "Document must contain readable content"},
+    {"rule": "name_match_fuzzy", "params": {"threshold": 0.7}, "description": "Name on document should match lead name"},
+]
 
 
 async def get_extraction_agent_config(db, tenant_id: str) -> dict:
@@ -41,7 +54,32 @@ async def get_extraction_agent_config(db, tenant_id: str) -> dict:
     )
     if agent and agent.get("config"):
         return agent["config"]
-    return {"classification_confidence_threshold": 75, "extraction_fields_by_doc_type": {}}
+    logger.warning(f"No active EXTRACTION_AI agent for tenant_id={tenant_id} — using built-in defaults")
+    return {
+        "classification_confidence_threshold": 75,
+        "classification_prompt_additions": "",
+        "extraction_prompt_additions": "",
+        "extraction_fields_by_doc_type": _DEFAULT_EXTRACTION_FIELDS,
+    }
+
+
+# Default extraction fields per document type (used when no EXTRACTION_AI agent in DB)
+_DEFAULT_EXTRACTION_FIELDS: dict = {
+    "PAN_CARD": ["pan_number", "name_on_pan", "date_of_birth", "father_name"],
+    "AADHAAR_CARD": ["aadhaar_number", "name", "date_of_birth", "address", "gender"],
+    "BANK_STATEMENT": ["account_number", "bank_name", "account_holder", "period_from", "period_to", "opening_balance", "closing_balance"],
+    "ITR": ["assessment_year", "pan_number", "name", "total_income", "tax_paid", "filing_date"],
+    "GST_CERTIFICATE": ["gstin", "legal_name", "trade_name", "date_of_registration", "business_type"],
+    "PARTNERSHIP_DEED": ["firm_name", "partners", "date_of_deed", "business_nature"],
+    "COI": ["company_name", "cin_number", "date_of_incorporation", "registered_address"],
+    "MOA_AOA": ["company_name", "authorized_capital", "objectives"],
+    "UDYAM_CERTIFICATE": ["udyam_number", "enterprise_name", "type_of_enterprise", "date_of_registration"],
+    "ADDRESS_PROOF": ["name", "address", "document_type"],
+    "SALARY_SLIP": ["employee_name", "employer_name", "month", "gross_salary", "net_salary"],
+    "BALANCE_SHEET": ["company_name", "financial_year", "total_assets", "total_liabilities", "net_worth"],
+    "PNL_STATEMENT": ["company_name", "financial_year", "revenue", "expenses", "net_profit"],
+    "GST_RETURN": ["gstin", "return_period", "turnover", "tax_payable"],
+}
 
 
 async def get_doc_collection_config(db, tenant_id: str) -> dict:

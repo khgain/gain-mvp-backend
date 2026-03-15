@@ -813,17 +813,23 @@ async def confirm_portal_upload(
         "created_at": now,
     })
 
-    if is_zip:
-        from app.workers.ai_worker import extract_zip
-        extract_zip.apply_async(
-            kwargs={"phys_file_id": phys_file_id, "tenant_id": current_user.tenant_id},
-            queue="zip",
-        )
+    # Run doc processing pipeline directly (Celery/SQS may not be available)
+    if not is_zip:
+        from app.routes.webhooks import _run_doc_processing_pipeline
+        try:
+            await _run_doc_processing_pipeline(
+                file_s3_key=s3_key,
+                lead_id=lead_id,
+                tenant_id=current_user.tenant_id,
+                original_filename=filename,
+                file_size_bytes=file_size_bytes,
+                waha_message_id="",
+                channel="PORTAL_UPLOAD",
+            )
+            logger.info(f"[PORTAL UPLOAD] Pipeline completed for {filename} lead_id={lead_id}")
+        except Exception as exc:
+            logger.error(f"[PORTAL UPLOAD] Pipeline failed for {filename}: {exc}", exc_info=True)
     else:
-        from app.workers.ai_worker import classify_document
-        classify_document.apply_async(
-            kwargs={"phys_file_id": phys_file_id, "tenant_id": current_user.tenant_id},
-            queue="ai-classification",
-        )
+        logger.info(f"[PORTAL UPLOAD] ZIP file uploaded — manual processing needed: {filename}")
 
-    return _success({"phys_file_id": phys_file_id, "status": "queued"}, "File registered")
+    return _success({"phys_file_id": phys_file_id, "status": "processing"}, "File registered and processing")
