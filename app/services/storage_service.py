@@ -99,9 +99,23 @@ async def generate_view_url(
         )
     try:
         s3 = _get_s3_client()
+        # Determine content type from key extension for inline display
+        ext = s3_key.rsplit(".", 1)[-1].lower() if "." in s3_key else ""
+        content_type_map = {
+            "pdf": "application/pdf",
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+        }
+        params = {"Bucket": settings.S3_BUCKET_NAME, "Key": s3_key}
+        # Force inline display in browser instead of downloading
+        ct = content_type_map.get(ext, "")
+        if ct:
+            params["ResponseContentType"] = ct
+        params["ResponseContentDisposition"] = "inline"
         url = s3.generate_presigned_url(
             "get_object",
-            Params={"Bucket": settings.S3_BUCKET_NAME, "Key": s3_key},
+            Params=params,
             ExpiresIn=expiry_seconds,
         )
         logger.info(f"Generated presigned URL for key={s3_key} expiry={expiry_seconds}s")
@@ -134,18 +148,14 @@ async def get_upload_presigned_url(
         raise HTTPException(status_code=500, detail="Could not generate upload URL") from exc
 
 
-def stream_zip_from_s3_files(
-    files: list[dict],  # [{"s3_key": ..., "doc_type": ..., "filename": ...}]
-) -> bytes:
+def stream_zip_from_s3_files(files) -> bytes:
     """
     Assemble a ZIP in memory with category subfolders.
-    For large downloads this should be streamed — this synchronous version
-    is used for moderate-sized ZIPs. The streaming variant will be added in Day 2
-    with proper async generator + StreamingResponse.
+    files: list of dicts with keys s3_key, doc_type, filename.
     """
     buf = io.BytesIO()
     s3 = _get_s3_client()
-    category_counters: dict[str, int] = {}
+    category_counters = {}
 
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for i, file_info in enumerate(files, start=1):
