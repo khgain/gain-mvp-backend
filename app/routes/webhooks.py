@@ -534,6 +534,7 @@ async def _process_incoming_media(
     """Download a media file from WAHA, upload to S3, and enqueue processing."""
     import time
     import httpx
+    from urllib.parse import quote as url_quote
     from app.services.storage_service import upload_file, build_s3_key
 
     if not settings.WAHA_BASE_URL or not settings.WAHA_API_KEY:
@@ -548,7 +549,11 @@ async def _process_incoming_media(
         or msg.get("title")  # WAHA NOWEB engine uses 'title' for document name
         or f"document_{int(time.time())}.pdf"
     )
-    mimetype = media_info.get("mimetype", "") or msg.get("mimetype", "") or msg.get("mime", "")
+    mimetype = (
+        media_info.get("mimetype", "")
+        or msg.get("mimetype", "")
+        or msg.get("mime", "")
+    )
 
     # Get message ID for download URL
     msg_id = waha_message_id or msg.get("id", "")
@@ -556,44 +561,99 @@ async def _process_incoming_media(
         logger.warning(f"No message ID for media download — lead_id={lead_id}")
         return
 
-    # Use the session from the webhook payload (not hardcoded 'default')
     session_name = payload.get("session", "default")
+    base = settings.WAHA_BASE_URL.rstrip("/")
+    headers = {"X-Api-Key": settings.WAHA_API_KEY}
 
-    # WAHA supports multiple download endpoints — try mediaUrl first if available
-    media_url = msg.get("mediaUrl", "")
-    download_url = media_url or f"{settings.WAHA_BASE_URL.rstrip('/')}/api/{session_name}/messages/{msg_id}/download"
-    # Fallback: older WAHA API format
-    download_url_fallback = f"{settings.WAHA_BASE_URL.rstrip('/')}/api/messages/{session_name}/download/{msg_id}"
+    # Detect file extension from mimetype for file-based URLs
+    ext_map = {
+        "application/pdf": "pdf", "image/jpeg": "jpeg", "image/jpg": "jpg",
+        "image/png": "png", "image/webp": "webp",
+    }
+    ext = ext_map.get(mimetype, original_filename.rsplit(".", 1)[-1] if "." in original_filename else "pdf")
 
     logger.info(
-        f"[MEDIA] Download plan: url={download_url} fallback={download_url_fallback} "
-        f"filename={original_filename} msg_id={msg_id} session={session_name} "
-        f"media_url={media_url!r} mimetype={mimetype!r}"
+        f"[MEDIA] Starting download: msg_id={msg_id} filename={original_filename} "
+        f"mimetype={mimetype!r} ext={ext} session={session_name} lead_id={lead_id}"
     )
+
     file_bytes = None
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            # Try primary URL first
-            resp = await client.get(download_url, headers={"X-Api-Key": settings.WAHA_API_KEY})
-            logger.info(f"[MEDIA] WAHA download (primary): status={resp.status_code} content_length={len(resp.content)} url={download_url}")
 
-            if resp.status_code >= 400 and download_url != download_url_fallback:
-                # Try fallback URL format
-                logger.info(f"[MEDIA] Primary failed ({resp.status_code}), trying fallback: {download_url_fallback}")
-                resp = await client.get(download_url_fallback, headers={"X-Api-Key": settings.WAHA_API_KEY})
-                logger.info(f"[MEDIA] WAHA download (fallback): status={resp.status_code} content_length={len(resp.content)}")
+    # ── Strategy 1: base64 data in webhook payload (most reliable — no HTTP needed) ──
+    b64_data = None
+    if isinstance(msg.get("_data"), dict):
+        b64_data = msg["_data"].get("body")
+    if not b64_data and isinstance(msg.get("media"), dict):
+        b64_data = msg["media"].get("data")
+    if b64_data:
+        try:
+            import base64
+            file_bytes = base64.b64decode(b64_data)
+            logger.info(f"[MEDIA] Strategy 1 (base64 payload): decoded {len(file_bytes)} bytes")
+        except Exception as exc:
+            logger.warning(f"[MEDIA] Strategy 1 (base64) decode failed: {exc}")
+            file_bytes = None
 
-            resp.raise_for_status()
-            file_bytes = resp.content
+    # ── Strategy 2: mediaUrl from payload ──
+    if not file_bytes:
+        media_url = msg.get("mediaUrl", "")
+        if media_url:
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.get(media_url, headers=headers)
+                    logger.info(f"[MEDIA] Strategy 2 (mediaUrl): status={resp.status_code} size={len(resp.content)} url={media_url}")
+                    if resp.status_code == 200 and len(resp.content) > 100:
+                        file_bytes = resp.content
+            except Exception as exc:
+                logger.warning(f"[MEDIA] Strategy 2 (mediaUrl) failed: {exc}")
 
-        logger.info(f"[MEDIA] Downloaded media from WAHA: {original_filename} ({len(file_bytes)} bytes)")
-    except Exception as exc:
-        logger.error(f"[MEDIA] WAHA media download FAILED for lead_id={lead_id} url={download_url}: {exc}", exc_info=True)
-        return
+    # ── Strategy 3: WAHA file-serving endpoint (files stored in /tmp/whatsapp-files/) ──
+    if not file_bytes:
+        # WAHA saves files as /tmp/whatsapp-files/{session}/{messageId}.{ext}
+        # and serves them via GET /api/files/{session}/{filename}
+        file_url = f"{base}/api/files/{session_name}/{url_quote(msg_id, safe='')}.{ext}"
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.get(file_url, headers=headers)
+                logger.info(f"[MEDIA] Strategy 3 (file API): status={resp.status_code} size={len(resp.content)} url={file_url}")
+                if resp.status_code == 200 and len(resp.content) > 100:
+                    file_bytes = resp.content
+        except Exception as exc:
+            logger.warning(f"[MEDIA] Strategy 3 (file API) failed: {exc}")
+
+    # ── Strategy 4: WAHA download endpoints (URL-encode msg_id to handle @lid) ──
+    if not file_bytes:
+        encoded_msg_id = url_quote(msg_id, safe="")
+        urls_to_try = [
+            f"{base}/api/{session_name}/messages/{encoded_msg_id}/download",
+            f"{base}/api/messages/{session_name}/download/{encoded_msg_id}",
+        ]
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                for url in urls_to_try:
+                    resp = await client.get(url, headers=headers)
+                    logger.info(f"[MEDIA] Strategy 4 (download API): status={resp.status_code} size={len(resp.content)} url={url}")
+                    if resp.status_code == 200 and len(resp.content) > 100:
+                        file_bytes = resp.content
+                        break
+        except Exception as exc:
+            logger.warning(f"[MEDIA] Strategy 4 (download API) failed: {exc}")
 
     if not file_bytes or len(file_bytes) < 100:
-        logger.error(f"[MEDIA] Downloaded file too small ({len(file_bytes) if file_bytes else 0} bytes) — likely invalid. Skipping.")
+        logger.error(
+            f"[MEDIA] ALL download strategies FAILED for lead_id={lead_id} msg_id={msg_id}. "
+            f"No media bytes obtained. Check WAHA version and media configuration."
+        )
+        # Log activity so failure is visible in the UI
+        await db.activity_feed.insert_one({
+            "tenant_id": tenant_id, "lead_id": lead_id,
+            "event_type": "PIPELINE_ERROR",
+            "message": f"WhatsApp media download failed for {original_filename} — all strategies exhausted",
+            "created_at": now,
+        })
         return
+
+    logger.info(f"[MEDIA] Successfully obtained {len(file_bytes)} bytes for {original_filename}")
 
     # Upload to S3
     s3_key = build_s3_key(tenant_id, lead_id, original_filename)
