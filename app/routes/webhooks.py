@@ -237,6 +237,18 @@ async def whatsapp_incoming(request: Request):
     tenant_id = None
     is_lid = sender_chat_id.endswith("@lid")  # Meta LID format (opaque ID, not a phone number)
 
+    # Helper: find the most recent lead matching a query (prefer DOC_COLLECTION status)
+    async def _find_best_lead(query: dict):
+        """Return the most recent matching lead, preferring active DOC_COLLECTION status."""
+        candidates = await db.leads.find(query).sort("created_at", -1).to_list(10)
+        if not candidates:
+            return None
+        # Prefer lead in DOC_COLLECTION status (actively awaiting docs)
+        for c in candidates:
+            if c.get("status") == "DOC_COLLECTION":
+                return c
+        return candidates[0]  # fallback to most recent
+
     if sender_chat_id:
         session = payload.get("session", "default")
         tenant_id = _extract_tenant_from_session(session)
@@ -247,18 +259,31 @@ async def whatsapp_incoming(request: Request):
             mobile_hash = compute_mobile_hash(digits)
             logger.info(f"[WA LOOKUP] Strategy 1: mobile_hash — digits={digits} hash={mobile_hash[:16]}...")
             if tenant_id:
-                lead = await db.leads.find_one({"tenant_id": tenant_id, "mobile_hash": mobile_hash})
+                lead = await _find_best_lead({"tenant_id": tenant_id, "mobile_hash": mobile_hash})
             else:
-                lead = await db.leads.find_one({"mobile_hash": mobile_hash})
+                lead = await _find_best_lead({"mobile_hash": mobile_hash})
             if lead:
-                logger.info(f"[WA LOOKUP] Found by mobile_hash — lead_id={lead['_id']}")
+                logger.info(f"[WA LOOKUP] Found by mobile_hash — lead_id={lead['_id']} status={lead.get('status')}")
 
         # ── Strategy 2: stored whatsapp_lid lookup ──
         if not lead and is_lid:
             logger.info(f"[WA LOOKUP] Strategy 2: LID lookup — sender={sender_chat_id}")
-            lead = await db.leads.find_one({"whatsapp_lid": sender_chat_id})
-            if lead:
-                logger.info(f"[WA LOOKUP] Found by stored LID — lead_id={lead['_id']}")
+            lid_lead = await db.leads.find_one({"whatsapp_lid": sender_chat_id})
+            if lid_lead:
+                # Check if there's a better (newer) lead with the same phone
+                mobile_hash = lid_lead.get("mobile_hash")
+                if mobile_hash:
+                    lead = await _find_best_lead({"mobile_hash": mobile_hash})
+                    if lead and str(lead["_id"]) != str(lid_lead["_id"]):
+                        # Migrate LID to the better lead
+                        await db.leads.update_one({"_id": lid_lead["_id"]}, {"$unset": {"whatsapp_lid": ""}})
+                        await db.leads.update_one({"_id": lead["_id"]}, {"$set": {"whatsapp_lid": sender_chat_id}})
+                        logger.info(f"[WA LOOKUP] Migrated LID from {lid_lead['_id']} to {lead['_id']}")
+                    elif not lead:
+                        lead = lid_lead
+                else:
+                    lead = lid_lead
+                logger.info(f"[WA LOOKUP] Found by stored LID — lead_id={lead['_id']} status={lead.get('status')}")
 
         # ── Strategy 3: resolve LID via WAHA contacts API ──
         if not lead and is_lid:
@@ -267,14 +292,14 @@ async def whatsapp_incoming(request: Request):
             if resolved_phone:
                 mobile_hash = compute_mobile_hash(resolved_phone)
                 logger.info(f"[WA LOOKUP] LID resolved to phone={resolved_phone} hash={mobile_hash[:16]}...")
-                lead = await db.leads.find_one({"mobile_hash": mobile_hash})
+                lead = await _find_best_lead({"mobile_hash": mobile_hash})
                 if lead:
                     # Cache the LID on the lead for future fast lookups
                     await db.leads.update_one(
                         {"_id": lead["_id"]},
                         {"$set": {"whatsapp_lid": sender_chat_id}}
                     )
-                    logger.info(f"[WA LOOKUP] Found by resolved phone — lead_id={lead['_id']} (LID cached)")
+                    logger.info(f"[WA LOOKUP] Found by resolved phone — lead_id={lead['_id']} status={lead.get('status')} (LID cached)")
 
         # ── Strategy 4: reverse-lookup via outbound message history ──
         if not lead and is_lid:
