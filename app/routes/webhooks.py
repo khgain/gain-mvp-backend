@@ -173,6 +173,12 @@ async def elevenlabs_call_status(
 # WAHA — WhatsApp incoming messages and documents
 # ---------------------------------------------------------------------------
 
+@router.get("/whatsapp/incoming")
+async def whatsapp_incoming_test():
+    """Quick GET test to verify route is reachable."""
+    return {"status": "ok", "route": "/webhooks/whatsapp/incoming", "method": "GET — use POST for actual webhook"}
+
+
 @router.post("/whatsapp/incoming")
 async def whatsapp_incoming(request: Request):
     """
@@ -186,10 +192,18 @@ async def whatsapp_incoming(request: Request):
       5. If text "HELP": resend checklist (enqueue send_doc_checklist_whatsapp)
     """
     body_bytes = await request.body()
+
+    # ── EARLY DIAGNOSTIC LOG — fires for EVERY incoming request ──
+    logger.info(f"[WA WEBHOOK HIT] raw_body_length={len(body_bytes)} bytes")
+
     try:
         payload = json.loads(body_bytes)
     except json.JSONDecodeError:
+        logger.error(f"[WA WEBHOOK] Invalid JSON: {body_bytes[:200]}")
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    # Log top-level keys to understand WAHA's payload structure
+    logger.info(f"[WA WEBHOOK] top_keys={list(payload.keys())} event={payload.get('event')} session={payload.get('session')}")
 
     # WAHA payload structure: { event: "message", session: "default", payload: { from, body, hasMedia, ... } }
     event = payload.get("event", "")
@@ -201,12 +215,13 @@ async def whatsapp_incoming(request: Request):
     waha_message_id = msg.get("id", {}).get("id", "") if isinstance(msg.get("id"), dict) else str(msg.get("id", ""))
 
     logger.info(
-        f"WhatsApp incoming — event={event} sender={sender_chat_id} "
-        f"hasMedia={has_media} body={body_text[:50]!r}"
+        f"[WA WEBHOOK] parsed — event={event} sender={sender_chat_id} "
+        f"hasMedia={has_media} body={body_text[:50]!r} msg_id={waha_message_id}"
     )
 
     # Only handle message events
     if event and event not in ("message", "message.any"):
+        logger.info(f"[WA WEBHOOK] Ignoring event={event}")
         return _ok("Event ignored")
 
     # Find the lead this sender belongs to
