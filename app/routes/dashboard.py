@@ -7,6 +7,7 @@ from typing import Optional
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, Request
+from pydantic import BaseModel
 
 from app.auth import get_current_user, CurrentUser
 from app.database import get_db
@@ -300,23 +301,23 @@ async def get_review_queue_stats(current_user: CurrentUser = Depends(get_current
 # Resolves lead_id from the phys_file automatically
 # ---------------------------------------------------------------------------
 
+class ReviewBody(BaseModel):
+    decision: str
+    doc_type: Optional[str] = ""
+    notes: Optional[str] = ""
+
+
 @router.post("/documents/{file_id}/review")
 async def queue_review_file(
     file_id: str,
-    request: Request,
+    body: ReviewBody,
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
     Convenience wrapper for the review queue page.
     Accepts {decision, doc_type, notes} without requiring lead_id in the URL.
     """
-    try:
-        body = await request.json()
-    except Exception as exc:
-        logger.error(f"Failed to parse review request body: {exc}")
-        return {"success": False, "message": f"Invalid request body: {exc}"}
-
-    logger.info(f"Review file {file_id}: {body}")
+    logger.info(f"Review file {file_id}: decision={body.decision}, doc_type={body.doc_type}, notes={body.notes}")
 
     from app.models.document import ReviewDecision, DocType
     db = get_db()
@@ -331,13 +332,14 @@ async def queue_review_file(
         return {"success": False, "message": f"Invalid file_id: {file_id}"}
 
     if not phys_file:
+        logger.warning(f"File not found: {file_id} for tenant {current_user.tenant_id}")
         return {"success": False, "message": "File not found"}
 
     lead_id = phys_file.get("lead_id")
     now = datetime.now(timezone.utc)
-    decision = body.get("decision", "")
-    doc_type_str = body.get("doc_type", "")
-    notes = body.get("notes", "")
+    decision = body.decision
+    doc_type_str = body.doc_type or ""
+    notes = body.notes or ""
 
     try:
         if decision == "CONFIRM_SINGLE":
@@ -352,22 +354,46 @@ async def queue_review_file(
             except ValueError:
                 doc_type_enum = DocType.OTHER
 
-            result = await db.logical_docs.insert_one({
+            # Check if a logical doc already exists for this physical file
+            # (the AI pipeline may have already created one)
+            existing_ldoc = await db.logical_docs.find_one({
+                "physical_file_ids": file_id,
                 "lead_id": lead_id,
                 "tenant_id": current_user.tenant_id,
-                "doc_type": doc_type_enum.value,
-                "assembly_type": "SINGLE",
-                "physical_file_ids": [file_id],
-                "completeness_status": "COMPLETE",
-                "is_mandatory": True,
-                "extracted_data": {},
-                "status": "READY_FOR_EXTRACTION",
-                "created_at": now,
-                "updated_at": now,
             })
-            logical_doc_id = str(result.inserted_id)
 
-            await db.phys_files.update_one(
+            if existing_ldoc:
+                # Update the existing logical doc with the confirmed doc type
+                logical_doc_id = str(existing_ldoc["_id"])
+                await db.logical_docs.update_one(
+                    {"_id": existing_ldoc["_id"]},
+                    {"$set": {
+                        "doc_type": doc_type_enum.value,
+                        "status": "READY_FOR_EXTRACTION",
+                        "completeness_status": "COMPLETE",
+                        "updated_at": now,
+                    }},
+                )
+                logger.info(f"Updated existing logical_doc {logical_doc_id} with doc_type={doc_type_enum.value}")
+            else:
+                # Create a new logical doc
+                result = await db.logical_docs.insert_one({
+                    "lead_id": lead_id,
+                    "tenant_id": current_user.tenant_id,
+                    "doc_type": doc_type_enum.value,
+                    "assembly_type": "SINGLE",
+                    "physical_file_ids": [file_id],
+                    "completeness_status": "COMPLETE",
+                    "is_mandatory": True,
+                    "extracted_data": {},
+                    "status": "READY_FOR_EXTRACTION",
+                    "created_at": now,
+                    "updated_at": now,
+                })
+                logical_doc_id = str(result.inserted_id)
+                logger.info(f"Created new logical_doc {logical_doc_id} with doc_type={doc_type_enum.value}")
+
+            upd = await db.phys_files.update_one(
                 {"_id": ObjectId(file_id)},
                 {"$set": {
                     "status": "HUMAN_REVIEWED",
@@ -378,6 +404,7 @@ async def queue_review_file(
                     "updated_at": now,
                 }, "$addToSet": {"logical_doc_ids": logical_doc_id}},
             )
+            logger.info(f"CONFIRM phys_file update: matched={upd.matched_count}, modified={upd.modified_count}")
 
             # Activity feed
             await db.activity_feed.insert_one({
@@ -403,7 +430,7 @@ async def queue_review_file(
             return _success({"decision": "CONFIRM_SINGLE", "logical_doc_id": logical_doc_id}, "Document classified")
 
         elif decision == "REJECT":
-            await db.phys_files.update_one(
+            upd = await db.phys_files.update_one(
                 {"_id": ObjectId(file_id)},
                 {"$set": {
                     "status": "HUMAN_REVIEWED",
@@ -414,6 +441,21 @@ async def queue_review_file(
                     "updated_at": now,
                 }},
             )
+            logger.info(f"REJECT phys_file update: matched={upd.matched_count}, modified={upd.modified_count}")
+
+            # Also mark any existing logical doc for this file as REJECTED
+            existing_ldoc = await db.logical_docs.find_one({
+                "physical_file_ids": file_id,
+                "lead_id": lead_id,
+                "tenant_id": current_user.tenant_id,
+            })
+            if existing_ldoc:
+                await db.logical_docs.update_one(
+                    {"_id": existing_ldoc["_id"]},
+                    {"$set": {"status": "REJECTED", "updated_at": now}},
+                )
+                logger.info(f"Marked logical_doc {existing_ldoc['_id']} as REJECTED")
+
             await db.activity_feed.insert_one({
                 "lead_id": lead_id,
                 "tenant_id": current_user.tenant_id,
