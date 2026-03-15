@@ -892,22 +892,36 @@ async def reject_logical_doc(
 @router.get("/{lead_id}/download-zip")
 async def download_documents_zip(
     lead_id: str,
+    filter: str = Query(default="verified", description="Filter: verified, failed, or all"),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
-    Stream all Tier1-passed logical docs for this lead as a categorised ZIP.
-    Category folders: KYC, Financials, Business, Property.
+    Stream logical docs for this lead as a categorised ZIP.
+    filter=verified (default) — only Tier1-passed / human-reviewed docs.
+    filter=failed  — only Tier1-failed docs.
+    filter=all     — every received doc regardless of status.
     """
     db = get_db()
     lead = await _get_lead_or_404(db, lead_id, current_user.tenant_id)
 
-    # Collect approved logical docs
-    files_to_zip = []
-    async for doc in db.logical_docs.find({
+    # Build status filter based on query param
+    if filter == "failed":
+        status_filter = {"$in": ["TIER1_FAILED", "REJECTED"]}
+    elif filter == "all":
+        status_filter = {"$exists": True}
+    else:
+        status_filter = {"$in": ["TIER1_PASSED", "HUMAN_REVIEWED"]}
+
+    query = {
         "lead_id": lead_id,
         "tenant_id": current_user.tenant_id,
-        "status": {"$in": ["TIER1_PASSED", "HUMAN_REVIEWED"]},
-    }):
+    }
+    if filter != "all":
+        query["status"] = status_filter
+
+    # Collect logical docs
+    files_to_zip = []
+    async for doc in db.logical_docs.find(query):
         phys_file_ids = doc.get("physical_file_ids", [])
         for fid in phys_file_ids:
             pf = await db.phys_files.find_one({"_id": ObjectId(fid)})
@@ -919,7 +933,7 @@ async def download_documents_zip(
                 })
 
     if not files_to_zip:
-        raise HTTPException(status_code=404, detail="No approved documents to download")
+        raise HTTPException(status_code=404, detail="No documents to download for the selected filter")
 
     from app.services.storage_service import stream_zip_from_s3_files
     zip_bytes = stream_zip_from_s3_files(files_to_zip)

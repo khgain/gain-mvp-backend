@@ -122,6 +122,7 @@ async def get_doc_status(db, lead_id: str, tenant_id: str) -> dict:
                 "status": status,
                 "doc_type": ldoc.get("doc_type"),
                 "logical_doc_id": str(ldoc["_id"]),
+                "physical_file_id": pf_id,
                 "received_at": ldoc.get("created_at", "").isoformat() if hasattr(ldoc.get("created_at"), "isoformat") else None,
                 "validation_status": ldoc.get("status"),
                 "validation_detail": _get_validation_detail(ldoc),
@@ -160,6 +161,7 @@ def _build_checklist_item(
         "status": "PENDING",
         "doc_type": None,
         "logical_doc_id": None,
+        "physical_file_id": None,
         "received_at": None,
         "validation_status": None,
         "validation_detail": None,
@@ -181,6 +183,7 @@ def _build_checklist_item(
             item["status"] = _resolve_status(ldoc)
             item["doc_type"] = doc_type
             item["logical_doc_id"] = ldoc_id
+            item["physical_file_id"] = pf_id
             item["received_at"] = ldoc.get("created_at", "").isoformat() if hasattr(ldoc.get("created_at"), "isoformat") else None
             item["validation_status"] = ldoc.get("status")
             item["validation_detail"] = _get_validation_detail(ldoc)
