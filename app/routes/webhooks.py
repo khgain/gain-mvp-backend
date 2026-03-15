@@ -211,14 +211,27 @@ async def whatsapp_incoming(request: Request):
     msg = payload.get("payload", payload)  # some WAHA versions flatten this
 
     sender_chat_id = msg.get("from") or msg.get("chatId") or payload.get("sender", "")
-    has_media = msg.get("hasMedia", False)
     body_text = msg.get("body", "").strip()
     waha_message_id = msg.get("id", {}).get("id", "") if isinstance(msg.get("id"), dict) else str(msg.get("id", ""))
 
+    # Robust media detection — WAHA versions vary in how they signal media
+    has_media_flag = msg.get("hasMedia", False)
+    has_media_url = bool(msg.get("mediaUrl"))
+    has_media_data = bool(msg.get("_data", {}).get("body") if isinstance(msg.get("_data"), dict) else False)
+    has_media_key = bool(msg.get("media"))
+    msg_type = msg.get("type", "").lower()
+    is_doc_type = msg_type in ("document", "image", "video", "audio", "ptt", "sticker")
+    has_media = has_media_flag or has_media_url or has_media_data or has_media_key or is_doc_type
+
+    # Log full media diagnostics — critical for debugging WAHA payload differences
     logger.info(
         f"[WA WEBHOOK] parsed — event={event} sender={sender_chat_id} "
-        f"hasMedia={has_media} body={body_text[:50]!r} msg_id={waha_message_id}"
+        f"hasMedia={has_media} (flag={has_media_flag} url={has_media_url} data={has_media_data} "
+        f"media_key={has_media_key} type={msg_type!r} is_doc_type={is_doc_type}) "
+        f"body={body_text[:50]!r} msg_id={waha_message_id}"
     )
+    # Dump all msg keys so we can see exactly what WAHA sends
+    logger.info(f"[WA WEBHOOK] msg_keys={sorted(msg.keys()) if isinstance(msg, dict) else 'NOT_DICT'}")
 
     # Only handle message events
     if event and event not in ("message", "message.any"):
@@ -527,14 +540,15 @@ async def _process_incoming_media(
         logger.warning("WAHA not configured — cannot download media")
         return
 
-    # WAHA media info
+    # WAHA media info — try multiple locations where WAHA puts metadata
     media_info = msg.get("_data", {}) or msg.get("media", {}) or {}
     original_filename = (
         media_info.get("filename")
         or msg.get("filename")
+        or msg.get("title")  # WAHA NOWEB engine uses 'title' for document name
         or f"document_{int(time.time())}.pdf"
     )
-    mimetype = media_info.get("mimetype", "") or msg.get("mimetype", "")
+    mimetype = media_info.get("mimetype", "") or msg.get("mimetype", "") or msg.get("mime", "")
 
     # Get message ID for download URL
     msg_id = waha_message_id or msg.get("id", "")
@@ -542,22 +556,43 @@ async def _process_incoming_media(
         logger.warning(f"No message ID for media download — lead_id={lead_id}")
         return
 
-    download_url = f"{settings.WAHA_BASE_URL.rstrip('/')}/api/messages/default/download/{msg_id}"
-    logger.info(f"[MEDIA] Downloading from WAHA: url={download_url} filename={original_filename} msg_id={msg_id}")
+    # Use the session from the webhook payload (not hardcoded 'default')
+    session_name = payload.get("session", "default")
+
+    # WAHA supports multiple download endpoints — try mediaUrl first if available
+    media_url = msg.get("mediaUrl", "")
+    download_url = media_url or f"{settings.WAHA_BASE_URL.rstrip('/')}/api/{session_name}/messages/{msg_id}/download"
+    # Fallback: older WAHA API format
+    download_url_fallback = f"{settings.WAHA_BASE_URL.rstrip('/')}/api/messages/{session_name}/download/{msg_id}"
+
+    logger.info(
+        f"[MEDIA] Download plan: url={download_url} fallback={download_url_fallback} "
+        f"filename={original_filename} msg_id={msg_id} session={session_name} "
+        f"media_url={media_url!r} mimetype={mimetype!r}"
+    )
+    file_bytes = None
     try:
-        # Download from WAHA: GET /api/messages/{session}/download/{messageId}
         async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.get(
-                download_url,
-                headers={"X-Api-Key": settings.WAHA_API_KEY},
-            )
-            logger.info(f"[MEDIA] WAHA download response: status={resp.status_code} content_length={len(resp.content)}")
+            # Try primary URL first
+            resp = await client.get(download_url, headers={"X-Api-Key": settings.WAHA_API_KEY})
+            logger.info(f"[MEDIA] WAHA download (primary): status={resp.status_code} content_length={len(resp.content)} url={download_url}")
+
+            if resp.status_code >= 400 and download_url != download_url_fallback:
+                # Try fallback URL format
+                logger.info(f"[MEDIA] Primary failed ({resp.status_code}), trying fallback: {download_url_fallback}")
+                resp = await client.get(download_url_fallback, headers={"X-Api-Key": settings.WAHA_API_KEY})
+                logger.info(f"[MEDIA] WAHA download (fallback): status={resp.status_code} content_length={len(resp.content)}")
+
             resp.raise_for_status()
             file_bytes = resp.content
 
         logger.info(f"[MEDIA] Downloaded media from WAHA: {original_filename} ({len(file_bytes)} bytes)")
     except Exception as exc:
         logger.error(f"[MEDIA] WAHA media download FAILED for lead_id={lead_id} url={download_url}: {exc}", exc_info=True)
+        return
+
+    if not file_bytes or len(file_bytes) < 100:
+        logger.error(f"[MEDIA] Downloaded file too small ({len(file_bytes) if file_bytes else 0} bytes) — likely invalid. Skipping.")
         return
 
     # Upload to S3
