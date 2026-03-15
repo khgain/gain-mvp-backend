@@ -310,14 +310,26 @@ async def queue_review_file(
     Convenience wrapper for the review queue page.
     Accepts {decision, doc_type, notes} without requiring lead_id in the URL.
     """
+    try:
+        body = await request.json()
+    except Exception as exc:
+        logger.error(f"Failed to parse review request body: {exc}")
+        return {"success": False, "message": f"Invalid request body: {exc}"}
+
+    logger.info(f"Review file {file_id}: {body}")
+
     from app.models.document import ReviewDecision, DocType
-    body = await request.json()
     db = get_db()
 
-    phys_file = await db.phys_files.find_one({
-        "_id": ObjectId(file_id),
-        "tenant_id": current_user.tenant_id,
-    })
+    try:
+        phys_file = await db.phys_files.find_one({
+            "_id": ObjectId(file_id),
+            "tenant_id": current_user.tenant_id,
+        })
+    except Exception as exc:
+        logger.error(f"Invalid file_id {file_id}: {exc}")
+        return {"success": False, "message": f"Invalid file_id: {file_id}"}
+
     if not phys_file:
         return {"success": False, "message": "File not found"}
 
@@ -327,92 +339,97 @@ async def queue_review_file(
     doc_type_str = body.get("doc_type", "")
     notes = body.get("notes", "")
 
-    if decision == "CONFIRM_SINGLE":
-        if not doc_type_str:
-            return {"success": False, "message": "doc_type required for CONFIRM_SINGLE"}
+    try:
+        if decision == "CONFIRM_SINGLE":
+            if not doc_type_str:
+                return {"success": False, "message": "doc_type required for CONFIRM_SINGLE"}
 
-        # Normalise doc_type string to enum value
-        dt_upper = doc_type_str.upper().replace(" ", "_").replace("-", "_")
-        # Try matching DocType enum
-        try:
-            doc_type_enum = DocType(dt_upper)
-        except ValueError:
-            doc_type_enum = DocType.OTHER
+            # Normalise doc_type string to enum value
+            dt_upper = doc_type_str.upper().replace(" ", "_").replace("-", "_")
+            # Try matching DocType enum
+            try:
+                doc_type_enum = DocType(dt_upper)
+            except ValueError:
+                doc_type_enum = DocType.OTHER
 
-        result = await db.logical_docs.insert_one({
-            "lead_id": lead_id,
-            "tenant_id": current_user.tenant_id,
-            "doc_type": doc_type_enum.value,
-            "assembly_type": "SINGLE",
-            "physical_file_ids": [file_id],
-            "completeness_status": "COMPLETE",
-            "is_mandatory": True,
-            "extracted_data": {},
-            "status": "READY_FOR_EXTRACTION",
-            "created_at": now,
-            "updated_at": now,
-        })
-        logical_doc_id = str(result.inserted_id)
-
-        await db.phys_files.update_one(
-            {"_id": ObjectId(file_id)},
-            {"$set": {
-                "status": "HUMAN_REVIEWED",
-                "ambiguity_type": "NORMAL",
-                "reviewer_id": current_user.id,
-                "reviewed_at": now,
-                "review_notes": notes,
+            result = await db.logical_docs.insert_one({
+                "lead_id": lead_id,
+                "tenant_id": current_user.tenant_id,
+                "doc_type": doc_type_enum.value,
+                "assembly_type": "SINGLE",
+                "physical_file_ids": [file_id],
+                "completeness_status": "COMPLETE",
+                "is_mandatory": True,
+                "extracted_data": {},
+                "status": "READY_FOR_EXTRACTION",
+                "created_at": now,
                 "updated_at": now,
-            }, "$addToSet": {"logical_doc_ids": logical_doc_id}},
-        )
+            })
+            logical_doc_id = str(result.inserted_id)
 
-        # Activity feed
-        await db.activity_feed.insert_one({
-            "lead_id": lead_id,
-            "tenant_id": current_user.tenant_id,
-            "event_type": "DOCUMENT_RECEIVED",
-            "message": f"Document '{phys_file.get('original_filename', 'unknown')}' classified as {doc_type_enum.value.replace('_', ' ').title()} by reviewer"
-                       + (f" (note: {notes})" if notes else ""),
-            "created_at": now,
-            "created_by": current_user.id,
-        })
-
-        # Enqueue extraction (non-fatal)
-        try:
-            from app.workers.ai_worker import extract_document_data
-            extract_document_data.apply_async(
-                kwargs={"logical_doc_id": logical_doc_id, "tenant_id": current_user.tenant_id},
-                queue="ai-extraction",
+            await db.phys_files.update_one(
+                {"_id": ObjectId(file_id)},
+                {"$set": {
+                    "status": "HUMAN_REVIEWED",
+                    "ambiguity_type": "NORMAL",
+                    "reviewer_id": current_user.id,
+                    "reviewed_at": now,
+                    "review_notes": notes,
+                    "updated_at": now,
+                }, "$addToSet": {"logical_doc_ids": logical_doc_id}},
             )
-        except Exception as exc:
-            logger.warning(f"Failed to enqueue extraction for {logical_doc_id}: {exc}")
 
-        return _success({"decision": "CONFIRM_SINGLE", "logical_doc_id": logical_doc_id}, "Document classified")
+            # Activity feed
+            await db.activity_feed.insert_one({
+                "lead_id": lead_id,
+                "tenant_id": current_user.tenant_id,
+                "event_type": "DOCUMENT_RECEIVED",
+                "message": f"Document '{phys_file.get('original_filename', 'unknown')}' classified as {doc_type_enum.value.replace('_', ' ').title()} by reviewer"
+                           + (f" (note: {notes})" if notes else ""),
+                "created_at": now,
+                "created_by": current_user.id,
+            })
 
-    elif decision == "REJECT":
-        await db.phys_files.update_one(
-            {"_id": ObjectId(file_id)},
-            {"$set": {
-                "status": "HUMAN_REVIEWED",
-                "ambiguity_type": "NORMAL",
-                "reviewer_id": current_user.id,
-                "reviewed_at": now,
-                "review_notes": notes or "Rejected by reviewer",
-                "updated_at": now,
-            }},
-        )
-        await db.activity_feed.insert_one({
-            "lead_id": lead_id,
-            "tenant_id": current_user.tenant_id,
-            "event_type": "DOCUMENT_REJECTED",
-            "message": f"Document '{phys_file.get('original_filename', 'unknown')}' rejected by reviewer"
-                       + (f": {notes}" if notes else ""),
-            "created_at": now,
-            "created_by": current_user.id,
-        })
-        return _success({"decision": "REJECT"}, "Document rejected")
+            # Enqueue extraction (non-fatal)
+            try:
+                from app.workers.ai_worker import extract_document_data
+                extract_document_data.apply_async(
+                    kwargs={"logical_doc_id": logical_doc_id, "tenant_id": current_user.tenant_id},
+                    queue="ai-extraction",
+                )
+            except Exception as exc:
+                logger.warning(f"Failed to enqueue extraction for {logical_doc_id}: {exc}")
 
-    return {"success": False, "message": f"Unknown decision: {decision}"}
+            return _success({"decision": "CONFIRM_SINGLE", "logical_doc_id": logical_doc_id}, "Document classified")
+
+        elif decision == "REJECT":
+            await db.phys_files.update_one(
+                {"_id": ObjectId(file_id)},
+                {"$set": {
+                    "status": "HUMAN_REVIEWED",
+                    "ambiguity_type": "NORMAL",
+                    "reviewer_id": current_user.id,
+                    "reviewed_at": now,
+                    "review_notes": notes or "Rejected by reviewer",
+                    "updated_at": now,
+                }},
+            )
+            await db.activity_feed.insert_one({
+                "lead_id": lead_id,
+                "tenant_id": current_user.tenant_id,
+                "event_type": "DOCUMENT_REJECTED",
+                "message": f"Document '{phys_file.get('original_filename', 'unknown')}' rejected by reviewer"
+                           + (f": {notes}" if notes else ""),
+                "created_at": now,
+                "created_by": current_user.id,
+            })
+            return _success({"decision": "REJECT"}, "Document rejected")
+
+        return {"success": False, "message": f"Unknown decision: {decision}"}
+
+    except Exception as exc:
+        logger.error(f"Review file {file_id} failed: {exc}", exc_info=True)
+        return {"success": False, "message": f"Server error: {str(exc)}"}
 
 
 # ---------------------------------------------------------------------------
