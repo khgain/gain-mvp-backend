@@ -832,6 +832,17 @@ async def _run_doc_processing_pipeline(
 
     except Exception as exc:
         logger.error(f"[DOC PIPELINE] Failed for lead_id={lead_id} file={original_filename}: {exc}", exc_info=True)
+        # Write error to activity feed so it's visible in the UI
+        try:
+            db2 = get_db()
+            await db2.activity_feed.insert_one({
+                "tenant_id": tenant_id, "lead_id": lead_id,
+                "event_type": "PIPELINE_ERROR",
+                "message": f"Doc processing failed for {original_filename}: {str(exc)[:200]}",
+                "created_at": datetime.now(timezone.utc),
+            })
+        except Exception:
+            pass
 
 
 async def _send_doc_status_reply(
@@ -1177,6 +1188,39 @@ async def diagnostic_lead(lead_id: str):
     tenant_count = await db.tenants.count_documents({})
     active_tenants = await db.tenants.count_documents({"is_active": True})
 
+    # Get phys_files details (status, classification)
+    phys_files_detail = []
+    for pf in await db.phys_files.find({"lead_id": lead_id}).sort("created_at", -1).to_list(10):
+        phys_files_detail.append({
+            "id": str(pf["_id"]),
+            "filename": pf.get("original_filename"),
+            "status": pf.get("status"),
+            "file_type": pf.get("file_type"),
+            "channel": pf.get("channel_received"),
+            "s3_key": pf.get("s3_key", "")[:60],
+            "classification_confidence": pf.get("classification_confidence"),
+            "classification_reasoning": pf.get("classification_reasoning", "")[:100],
+            "file_size_bytes": pf.get("file_size_bytes"),
+            "created_at": str(pf.get("created_at", "")),
+        })
+
+    # Get logical_docs details
+    logical_docs_detail = []
+    for ld in await db.logical_docs.find({"lead_id": lead_id}).sort("created_at", -1).to_list(10):
+        logical_docs_detail.append({
+            "id": str(ld["_id"]),
+            "doc_type": ld.get("doc_type"),
+            "status": ld.get("status"),
+            "extracted_fields": list(ld.get("extracted_data", {}).keys()),
+            "tier1_passed": ld.get("tier1_validation", {}).get("passed") if ld.get("tier1_validation") else None,
+            "created_at": str(ld.get("created_at", "")),
+        })
+
+    # Check agent configs
+    extraction_agent = await db.agents.find_one({"tenant_id": tenant_id, "type": "EXTRACTION_AI", "status": "ACTIVE"})
+    validation_agent = await db.agents.find_one({"tenant_id": tenant_id, "type": "VALIDATION_AI", "status": "ACTIVE"})
+
+    import os
     return {
         "lead_id": lead_id,
         "tenant_id": tenant_id,
@@ -1187,8 +1231,20 @@ async def diagnostic_lead(lead_id: str):
         "whatsapp_messages": {"total": wa_count, "inbound": wa_inbound, "outbound": wa_outbound},
         "email_messages": {"total": email_count, "inbound": email_inbound, "outbound": email_outbound},
         "activity_feed": {"total": activity_count, "with_tenant_filter": activity_with_tenant},
-        "phys_files": phys_files_count,
-        "logical_docs": logical_docs_count,
+        "phys_files": {"count": phys_files_count, "details": phys_files_detail},
+        "logical_docs": {"count": logical_docs_count, "details": logical_docs_detail},
+        "agent_configs": {
+            "extraction_ai": bool(extraction_agent),
+            "validation_ai": bool(validation_agent),
+        },
+        "env_check": {
+            "ANTHROPIC_API_KEY": bool(settings.ANTHROPIC_API_KEY),
+            "S3_BUCKET_NAME": bool(settings.S3_BUCKET_NAME),
+            "AWS_ACCESS_KEY_ID": bool(settings.AWS_ACCESS_KEY_ID),
+            "AWS_SECRET_ACCESS_KEY": bool(settings.AWS_SECRET_ACCESS_KEY),
+            "WAHA_BASE_URL": bool(settings.WAHA_BASE_URL),
+            "CELERY_TASK_ALWAYS_EAGER": os.getenv("CELERY_TASK_ALWAYS_EAGER", "false"),
+        },
         "recent_activities": activities,
         "recent_wa_messages": wa_msgs,
     }
