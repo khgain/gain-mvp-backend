@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from app.auth import get_current_user, CurrentUser
@@ -329,11 +329,11 @@ async def queue_review_file(
         })
     except Exception as exc:
         logger.error(f"Invalid file_id {file_id}: {exc}")
-        return {"success": False, "message": f"Invalid file_id: {file_id}"}
+        raise HTTPException(status_code=400, detail=f"Invalid file_id: {file_id}")
 
     if not phys_file:
         logger.warning(f"File not found: {file_id} for tenant {current_user.tenant_id}")
-        return {"success": False, "message": "File not found"}
+        raise HTTPException(status_code=404, detail=f"File not found: {file_id}")
 
     lead_id = phys_file.get("lead_id")
     now = datetime.now(timezone.utc)
@@ -344,7 +344,7 @@ async def queue_review_file(
     try:
         if decision == "CONFIRM_SINGLE":
             if not doc_type_str:
-                return {"success": False, "message": "doc_type required for CONFIRM_SINGLE"}
+                raise HTTPException(status_code=400, detail="doc_type required for CONFIRM_SINGLE")
 
             # Normalise doc_type string to enum value
             dt_upper = doc_type_str.upper().replace(" ", "_").replace("-", "_")
@@ -467,11 +467,13 @@ async def queue_review_file(
             })
             return _success({"decision": "REJECT"}, "Document rejected")
 
-        return {"success": False, "message": f"Unknown decision: {decision}"}
+        raise HTTPException(status_code=400, detail=f"Unknown decision: {decision}")
 
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error(f"Review file {file_id} failed: {exc}", exc_info=True)
-        return {"success": False, "message": f"Server error: {str(exc)}"}
+        raise HTTPException(status_code=500, detail=f"Server error: {str(exc)}")
 
 
 # ---------------------------------------------------------------------------
