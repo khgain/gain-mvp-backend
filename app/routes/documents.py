@@ -588,13 +588,32 @@ async def get_lead_validation(
     lead = await _get_lead_or_404(db, lead_id, current_user.tenant_id)
 
     entity_type = lead.get("entity_type", "INDIVIDUAL")
+    logger.info(f"Validation tab — lead_id={lead_id} entity_type={entity_type}")
 
     # 1. Get doc checklist config
     from app.services.validation_rules import get_doc_collection_config
     doc_config = await get_doc_collection_config(db, current_user.tenant_id)
-    entity_checklist = doc_config.get("doc_checklist_by_entity_type", {}).get(entity_type, {})
+    checklist_by_entity = doc_config.get("doc_checklist_by_entity_type", {})
+    logger.info(f"Validation tab — checklist entity types: {list(checklist_by_entity.keys())}")
+
+    # Try exact match first, then case-insensitive, then default to INDIVIDUAL
+    entity_checklist = checklist_by_entity.get(entity_type, {})
+    if not entity_checklist:
+        # Case-insensitive fallback
+        for key, val in checklist_by_entity.items():
+            if key.upper() == entity_type.upper():
+                entity_checklist = val
+                break
+    if not entity_checklist:
+        # Fall back to INDIVIDUAL or first available
+        entity_checklist = checklist_by_entity.get("INDIVIDUAL", {})
+        if not entity_checklist and checklist_by_entity:
+            entity_checklist = next(iter(checklist_by_entity.values()), {})
+        logger.warning(f"Validation tab — no checklist for entity_type={entity_type}, using fallback")
+
     required_names = entity_checklist.get("required", [])
     optional_names = entity_checklist.get("optional", [])
+    logger.info(f"Validation tab — required={len(required_names)} optional={len(optional_names)}")
 
     # Build ordered list of (doc_type, label, required)
     checklist_items: list[tuple[str, str, bool]] = []
@@ -610,6 +629,8 @@ async def get_lead_validation(
             checklist_items.append((dt, name, False))
             seen_types.add(dt)
 
+    logger.info(f"Validation tab — checklist_items={[(c[0], c[2]) for c in checklist_items]}")
+
     # 2. Fetch all logical_docs for this lead
     logical_docs_by_type: dict[str, list[dict]] = {}
     async for doc in db.logical_docs.find(
@@ -618,6 +639,8 @@ async def get_lead_validation(
     ):
         dt = doc.get("doc_type", "UNKNOWN")
         logical_docs_by_type.setdefault(dt, []).append(doc)
+
+    logger.info(f"Validation tab — logical_docs types: {list(logical_docs_by_type.keys())} total={sum(len(v) for v in logical_docs_by_type.values())}")
 
     # Also add any doc types found in DB but not in checklist
     for dt in logical_docs_by_type:
