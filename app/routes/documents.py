@@ -678,7 +678,7 @@ async def reject_logical_doc(
         "lead_id": lead_id,
         "event_type": "DOCUMENT_REJECTED",
         "message": f"Document {doc.get('doc_type', 'UNKNOWN')} rejected: {body.reason[:100]}",
-        "created_by": current_user.id,
+        "created_by": current_user.user_id,
         "created_at": now,
     })
 
@@ -816,7 +816,7 @@ async def upload_direct(
         "lead_id": lead_id,
         "event_type": "DOCUMENT_UPLOADED",
         "message": f"Document uploaded via portal: {filename}",
-        "created_by": current_user.id,
+        "created_by": current_user.user_id,
         "created_at": now,
     })
 
@@ -886,7 +886,7 @@ async def confirm_portal_upload(
         "lead_id": lead_id,
         "event_type": "DOCUMENT_UPLOADED",
         "message": f"Document uploaded via portal: {filename}",
-        "created_by": current_user.id,
+        "created_by": current_user.user_id,
         "created_at": now,
     })
 
