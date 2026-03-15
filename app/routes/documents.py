@@ -509,7 +509,7 @@ async def list_logical_docs(
 # ---------------------------------------------------------------------------
 
 # Mapping from human-readable checklist names → doc_type enum values
-_CHECKLIST_NAME_TO_DOC_TYPE: dict[str, str] = {
+_CHECKLIST_NAME_TO_DOC_TYPE = {
     "aadhaar": "AADHAAR",
     "aadhaar card": "AADHAAR",
     "aadhaar card (front & back)": "AADHAAR",
@@ -616,8 +616,8 @@ async def get_lead_validation(
     logger.info(f"Validation tab — required={len(required_names)} optional={len(optional_names)}")
 
     # Build ordered list of (doc_type, label, required)
-    checklist_items: list[tuple[str, str, bool]] = []
-    seen_types: set[str] = set()
+    checklist_items = []   # list of (doc_type, label, required)
+    seen_types = set()
     for name in required_names:
         dt = _checklist_name_to_doc_type(name)
         if dt not in seen_types:
@@ -632,7 +632,7 @@ async def get_lead_validation(
     logger.info(f"Validation tab — checklist_items={[(c[0], c[2]) for c in checklist_items]}")
 
     # 2. Fetch all logical_docs for this lead
-    logical_docs_by_type: dict[str, list[dict]] = {}
+    logical_docs_by_type = {}  # doc_type → list of logical_doc dicts
     async for doc in db.logical_docs.find(
         {"lead_id": lead_id, "tenant_id": current_user.tenant_id},
         sort=[("created_at", -1)],
