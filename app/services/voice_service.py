@@ -319,6 +319,16 @@ async def process_call_completed(payload: dict) -> None:
 
     ai_summary = extracted_data.get("callSummary") or extracted_data.get("call_summary") or ""
 
+    # Compute duration from last transcript entry if still 0
+    if not duration_seconds and normalized_transcript:
+        last_entry = normalized_transcript[-1]
+        ts_str = last_entry.get("timestamp", "00:00")
+        try:
+            parts = ts_str.split(":")
+            duration_seconds = int(parts[0]) * 60 + int(parts[1])
+        except Exception:
+            pass
+
     call_update = {
         "elevenlabs_call_result": elevenlabs_status,
         "status": "COMPLETED" if elevenlabs_status in COMPLETED_STATUSES else "FAILED",

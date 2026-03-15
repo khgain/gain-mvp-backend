@@ -3,6 +3,7 @@ Calls and WhatsApp messages routes — PRD Section 6.2.
 
 GET /leads/:id/calls             — all call records, newest first
 GET /leads/:id/calls/:call_id    — one call with full transcript + extracted_fields
+GET /leads/:id/calls/:call_id/audio — proxy ElevenLabs recording audio
 GET /leads/:id/whatsapp-messages — full WhatsApp thread, oldest first (for chat window)
 
 All queries are scoped by tenant_id from JWT. Every record must belong to the
@@ -10,6 +11,7 @@ requesting tenant before it is returned.
 """
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from typing import Optional
 
 from app.auth import get_current_user, CurrentUser
@@ -41,6 +43,13 @@ def _serialize_call(doc: dict, include_transcript: bool = True) -> dict:
     for dt_field in ("initiated_at", "completed_at", "created_at", "updated_at"):
         if dt_field in result and result[dt_field] is not None:
             result[dt_field] = _isoformat(result[dt_field])
+
+    # Generate recording_url from conversation_id if ElevenLabs call
+    conv_id = result.get("conversation_id") or result.get("elevenlabs_conversation_id")
+    lead_id = result.get("lead_id", "")
+    call_id = result.get("id", "")
+    if conv_id and not result.get("recording_url"):
+        result["recording_url"] = f"/api/v1/leads/{lead_id}/calls/{call_id}/audio"
 
     return result
 
@@ -141,6 +150,81 @@ async def get_call(
         raise HTTPException(status_code=404, detail="Call record not found")
 
     return _success(data=_serialize_call(call, include_transcript=True))
+
+
+# ---------------------------------------------------------------------------
+# GET /leads/:id/calls/:call_id/audio — proxy ElevenLabs recording
+# ---------------------------------------------------------------------------
+
+@router.get("/leads/{lead_id}/calls/{call_id}/audio")
+async def get_call_audio(
+    lead_id: str,
+    call_id: str,
+    token: Optional[str] = Query(default=None),
+):
+    """
+    Stream the ElevenLabs call recording audio.
+    Proxies GET /v1/convai/conversations/{conversation_id}/audio.
+    Supports token as query param for <audio> elements that can't set headers.
+    """
+    import httpx
+    from app.config import settings
+    from app.auth import decode_access_token
+
+    # Try Bearer header first, then query param token
+    current_user = None
+    if token:
+        try:
+            payload = decode_access_token(token)
+            current_user = CurrentUser(
+                user_id=payload["sub"], tenant_id=payload["tenant_id"],
+                role=payload["role"], email=payload["email"],
+            )
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Authentication required — pass ?token=<jwt>")
+
+    db = get_db()
+    try:
+        call_oid = ObjectId(call_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid call ID")
+
+    call = await db.call_records.find_one({
+        "_id": call_oid,
+        "lead_id": lead_id,
+        "tenant_id": current_user.tenant_id,
+    })
+    if not call:
+        raise HTTPException(status_code=404, detail="Call record not found")
+
+    conv_id = call.get("conversation_id") or call.get("elevenlabs_conversation_id")
+    if not conv_id:
+        raise HTTPException(status_code=404, detail="No conversation ID — no recording available")
+
+    if not settings.ELEVENLABS_API_KEY:
+        raise HTTPException(status_code=503, detail="ElevenLabs not configured")
+
+    url = f"https://api.elevenlabs.io/v1/convai/conversations/{conv_id}/audio"
+    headers = {"xi-api-key": settings.ELEVENLABS_API_KEY}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            return StreamingResponse(
+                iter([resp.content]),
+                media_type=resp.headers.get("content-type", "audio/mpeg"),
+                headers={"Content-Disposition": f'inline; filename="call_{call_id}.mp3"'},
+            )
+    except httpx.HTTPStatusError as exc:
+        logger.warning(f"ElevenLabs audio fetch failed: {exc.response.status_code}")
+        raise HTTPException(status_code=exc.response.status_code, detail="Recording not available")
+    except Exception as exc:
+        logger.error(f"Audio proxy error: {exc}")
+        raise HTTPException(status_code=502, detail="Failed to fetch recording")
 
 
 # ---------------------------------------------------------------------------
