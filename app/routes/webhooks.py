@@ -17,6 +17,7 @@ import json
 import time
 from typing import Optional
 
+from bson import ObjectId
 from fastapi import APIRouter, Request, HTTPException, Header
 from fastapi.responses import JSONResponse
 
@@ -226,46 +227,102 @@ async def whatsapp_incoming(request: Request):
 
     # Find the lead this sender belongs to
     from app.database import get_db
-    from app.services.whatsapp_service import find_lead_by_whatsapp_number
+    from app.services.whatsapp_service import find_lead_by_whatsapp_number, compute_mobile_hash
     from datetime import datetime, timezone
 
     db = get_db()
     now = datetime.now(timezone.utc)
 
-    # Tenant detection: WAHA session name can carry tenant_id, or we search directly.
-    # MVP: single-tenant — search leads collection directly by mobile_hash.
     lead = None
     tenant_id = None
+    is_lid = sender_chat_id.endswith("@lid")  # Meta LID format (opaque ID, not a phone number)
+
     if sender_chat_id:
-        # Try session-based tenant_id first (production: session name = tenant_id)
         session = payload.get("session", "default")
         tenant_id = _extract_tenant_from_session(session)
 
-        if tenant_id:
-            lead = await find_lead_by_whatsapp_number(db, tenant_id, sender_chat_id)
-            logger.info(f"WhatsApp: session-based lookup tenant_id={tenant_id} found={lead is not None}")
-        else:
-            # MVP fallback: search leads directly by mobile_hash (no tenant filter)
-            from app.services.whatsapp_service import compute_mobile_hash
+        # ── Strategy 1: mobile_hash lookup (works for @c.us phone format) ──
+        if not is_lid:
             digits = sender_chat_id.split("@")[0]
             mobile_hash = compute_mobile_hash(digits)
-            logger.info(f"WhatsApp: direct mobile_hash lookup — digits={digits} hash={mobile_hash[:16]}...")
-            lead = await db.leads.find_one({"mobile_hash": mobile_hash})
-            if lead:
-                tenant_id = lead["tenant_id"]
-                logger.info(f"WhatsApp: found lead by direct mobile_hash — lead_id={lead['_id']} tenant_id={tenant_id}")
+            logger.info(f"[WA LOOKUP] Strategy 1: mobile_hash — digits={digits} hash={mobile_hash[:16]}...")
+            if tenant_id:
+                lead = await db.leads.find_one({"tenant_id": tenant_id, "mobile_hash": mobile_hash})
             else:
-                # Debug: check how many leads have mobile_hash at all
-                total_leads = await db.leads.count_documents({})
-                leads_with_hash = await db.leads.count_documents({"mobile_hash": {"$exists": True}})
-                logger.warning(
-                    f"WhatsApp: NO lead found — sender={sender_chat_id} digits={digits} "
-                    f"hash={mobile_hash[:16]}... total_leads={total_leads} leads_with_hash={leads_with_hash}"
-                )
+                lead = await db.leads.find_one({"mobile_hash": mobile_hash})
+            if lead:
+                logger.info(f"[WA LOOKUP] Found by mobile_hash — lead_id={lead['_id']}")
+
+        # ── Strategy 2: stored whatsapp_lid lookup ──
+        if not lead and is_lid:
+            logger.info(f"[WA LOOKUP] Strategy 2: LID lookup — sender={sender_chat_id}")
+            lead = await db.leads.find_one({"whatsapp_lid": sender_chat_id})
+            if lead:
+                logger.info(f"[WA LOOKUP] Found by stored LID — lead_id={lead['_id']}")
+
+        # ── Strategy 3: resolve LID via WAHA contacts API ──
+        if not lead and is_lid:
+            logger.info(f"[WA LOOKUP] Strategy 3: resolving LID via WAHA API...")
+            resolved_phone = await _resolve_lid_to_phone(sender_chat_id, session)
+            if resolved_phone:
+                mobile_hash = compute_mobile_hash(resolved_phone)
+                logger.info(f"[WA LOOKUP] LID resolved to phone={resolved_phone} hash={mobile_hash[:16]}...")
+                lead = await db.leads.find_one({"mobile_hash": mobile_hash})
+                if lead:
+                    # Cache the LID on the lead for future fast lookups
+                    await db.leads.update_one(
+                        {"_id": lead["_id"]},
+                        {"$set": {"whatsapp_lid": sender_chat_id}}
+                    )
+                    logger.info(f"[WA LOOKUP] Found by resolved phone — lead_id={lead['_id']} (LID cached)")
+
+        # ── Strategy 4: reverse-lookup via outbound message history ──
+        if not lead and is_lid:
+            logger.info(f"[WA LOOKUP] Strategy 4: checking outbound message history...")
+            # Find leads that have recent outbound WhatsApp messages and try WAHA contact check
+            recent_outbound = await db.whatsapp_messages.find(
+                {"direction": "OUTBOUND"},
+                sort=[("sent_at", -1)],
+            ).to_list(20)
+            candidate_lead_ids = list({m["lead_id"] for m in recent_outbound})
+            for candidate_lid in candidate_lead_ids:
+                candidate = await db.leads.find_one({"_id": ObjectId(candidate_lid)})
+                if not candidate:
+                    continue
+                # Check if this lead's phone matches the LID sender via WAHA
+                from app.utils.encryption import decrypt_field
+                try:
+                    phone_raw = decrypt_field(candidate.get("mobile", ""))
+                except Exception:
+                    continue
+                if not phone_raw:
+                    continue
+                phone_digits = "".join(c for c in phone_raw if c.isdigit())
+                if len(phone_digits) == 10:
+                    phone_digits = "91" + phone_digits  # Add India country code
+                match = await _check_waha_number_matches_lid(phone_digits, sender_chat_id, session)
+                if match:
+                    lead = candidate
+                    await db.leads.update_one(
+                        {"_id": lead["_id"]},
+                        {"$set": {"whatsapp_lid": sender_chat_id}}
+                    )
+                    logger.info(f"[WA LOOKUP] Found by outbound reverse-lookup — lead_id={lead['_id']} phone={phone_digits} (LID cached)")
+                    break
+
+        if not lead:
+            total_leads = await db.leads.count_documents({})
+            leads_with_hash = await db.leads.count_documents({"mobile_hash": {"$exists": True}})
+            logger.warning(
+                f"[WA LOOKUP] FAILED — sender={sender_chat_id} is_lid={is_lid} "
+                f"total_leads={total_leads} leads_with_hash={leads_with_hash}"
+            )
 
     if not lead:
         logger.info(f"WhatsApp: no lead found for sender={sender_chat_id} — ignoring")
         return _ok("Lead not found")
+
+    tenant_id = lead["tenant_id"]
 
     lead_id = str(lead["_id"])
     tenant_id = lead["tenant_id"]
@@ -323,6 +380,99 @@ def _extract_tenant_from_session(session: str) -> Optional[str]:
     if session.startswith("tenant_"):
         return session[7:]
     return None
+
+
+async def _resolve_lid_to_phone(lid_chat_id: str, session: str = "default") -> Optional[str]:
+    """
+    Try to resolve a Meta LID (e.g. 243189688569978@lid) to a phone number
+    via WAHA's contacts/chat API.
+    """
+    import httpx
+
+    if not settings.WAHA_BASE_URL or not settings.WAHA_API_KEY:
+        return None
+
+    base = settings.WAHA_BASE_URL.rstrip("/")
+    headers = {"X-Api-Key": settings.WAHA_API_KEY}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Try GET /api/contacts — some WAHA versions return phone in contact info
+            resp = await client.get(
+                f"{base}/api/contacts",
+                params={"session": session, "contactId": lid_chat_id},
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                # Response could be a single contact or list
+                contacts = data if isinstance(data, list) else [data]
+                for c in contacts:
+                    # Look for phone number in id, number, or pushname fields
+                    cid = c.get("id", {})
+                    if isinstance(cid, dict):
+                        user = cid.get("user", "")
+                        server = cid.get("server", "")
+                        if server == "c.us" and user:
+                            logger.info(f"[LID RESOLVE] Found phone via contacts API: {user}")
+                            return user
+                    phone = c.get("number") or c.get("phone")
+                    if phone:
+                        logger.info(f"[LID RESOLVE] Found phone in contact: {phone}")
+                        return phone
+
+            # Try GET /api/{session}/chats/{chatId} — may have participant phone
+            resp2 = await client.get(
+                f"{base}/api/{session}/chats/{lid_chat_id}",
+                headers=headers,
+            )
+            if resp2.status_code == 200:
+                chat = resp2.json()
+                # Check for phone in various fields
+                for field in ("number", "phone", "participant"):
+                    val = chat.get(field)
+                    if val and "@" not in str(val):
+                        logger.info(f"[LID RESOLVE] Found phone via chats API field={field}: {val}")
+                        return str(val)
+    except Exception as exc:
+        logger.warning(f"[LID RESOLVE] WAHA API call failed: {exc}")
+
+    logger.info(f"[LID RESOLVE] Could not resolve LID={lid_chat_id}")
+    return None
+
+
+async def _check_waha_number_matches_lid(
+    phone_digits: str, lid_chat_id: str, session: str = "default"
+) -> bool:
+    """
+    Check via WAHA if a phone number's WhatsApp chatId matches a given LID.
+    Uses WAHA's check-exists API to get the chatId for a phone number.
+    """
+    import httpx
+
+    if not settings.WAHA_BASE_URL or not settings.WAHA_API_KEY:
+        return False
+
+    base = settings.WAHA_BASE_URL.rstrip("/")
+    headers = {"X-Api-Key": settings.WAHA_API_KEY, "Content-Type": "application/json"}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{base}/api/contacts/check-exists",
+                json={"session": session, "phone": phone_digits},
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                # Response: { "numberExists": true, "chatId": "243189688569978@lid" }
+                existing_chat_id = data.get("chatId", "")
+                logger.info(f"[LID CHECK] phone={phone_digits} → chatId={existing_chat_id} target={lid_chat_id}")
+                return existing_chat_id == lid_chat_id
+    except Exception as exc:
+        logger.warning(f"[LID CHECK] WAHA check-exists failed for {phone_digits}: {exc}")
+
+    return False
 
 
 async def _process_incoming_media(

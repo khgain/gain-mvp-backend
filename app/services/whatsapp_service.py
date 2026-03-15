@@ -123,6 +123,9 @@ async def send_document_checklist(
                 headers={"X-Api-Key": settings.WAHA_API_KEY},
             )
             resp.raise_for_status()
+            # Capture chatId from WAHA response (may be LID format)
+            resp_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            await _cache_lid_from_response(lead_id, resp_data)
         logger.info(f"WhatsApp checklist sent — lead_id={lead_id} chat_id={chat_id}")
 
         # Persist outbound message for WhatsApp tab
@@ -204,6 +207,8 @@ async def send_text_message(lead_id: str, mobile: str, text: str, tenant_id: Opt
                 headers={"X-Api-Key": settings.WAHA_API_KEY},
             )
             resp.raise_for_status()
+            resp_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            await _cache_lid_from_response(lead_id, resp_data)
 
         # Persist outbound message for WhatsApp tab
         await _persist_outbound_message(lead_id, tenant_id, text, "TEXT", None)
@@ -211,6 +216,32 @@ async def send_text_message(lead_id: str, mobile: str, text: str, tenant_id: Opt
     except Exception as exc:
         logger.error(f"send_text_message failed for lead_id={lead_id}: {exc}")
         return False
+
+
+async def _cache_lid_from_response(lead_id: str, resp_data: dict) -> None:
+    """
+    If WAHA response contains a LID-format chatId, cache it on the lead
+    for future inbound message matching.
+    """
+    try:
+        # WAHA sendText response may include: { "id": {...}, "chatId": "243...@lid", ... }
+        chat_id = resp_data.get("chatId", "") or ""
+        # Also check nested structures
+        if not chat_id:
+            key = resp_data.get("key", {})
+            if isinstance(key, dict):
+                chat_id = key.get("remoteJid", "")
+        if chat_id and "@lid" in chat_id:
+            from app.database import get_db
+            from bson import ObjectId
+            db = get_db()
+            await db.leads.update_one(
+                {"_id": ObjectId(lead_id)},
+                {"$set": {"whatsapp_lid": chat_id}},
+            )
+            logger.info(f"[LID CACHE] Stored whatsapp_lid={chat_id} on lead_id={lead_id}")
+    except Exception as exc:
+        logger.warning(f"[LID CACHE] Failed to cache LID for lead_id={lead_id}: {exc}")
 
 
 async def _persist_outbound_message(
